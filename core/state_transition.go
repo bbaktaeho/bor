@@ -341,6 +341,9 @@ func (st *stateTransition) buyGas() error {
 func (st *stateTransition) preCheck() error {
 	// Only check transactions that are not fake
 	msg := st.msg
+	if msg.From.Cmp(common.Address{}) == 0 {
+		return nil
+	}
 	if !msg.SkipNonceChecks {
 		// Make sure this transaction's nonce is correct.
 		stNonce := st.state.GetNonce(msg.From)
