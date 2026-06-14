@@ -23,12 +23,17 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 	"gotest.tools/assert"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // precompiledTest defines the input/output pairs for precompiled contract tests.
@@ -61,6 +66,7 @@ var allPrecompiles = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{7}):    &bn256ScalarMulIstanbul{},
 	common.BytesToAddress([]byte{8}):    &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{9}):    &blake2F{},
+	common.BytesToAddress([]byte{0x0a}): &kzgPointEvaluation{},
 
 	common.BytesToAddress([]byte{0x0f, 0x0a}): &bls12381G1Add{},
 	common.BytesToAddress([]byte{0x0f, 0x0b}): &bls12381G1MultiExp{},
@@ -71,7 +77,8 @@ var allPrecompiles = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{0x0f, 0x10}): &bls12381MapG2{},
 	common.BytesToAddress([]byte{0x0f, 0x11}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x0f, 0x12}): &bls12381MapG2{},
-	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{},
+
+	common.BytesToAddress([]byte{0x0b}): &p256Verify{},
 }
 
 // EIP-152 test vectors
@@ -123,7 +130,7 @@ func testPrecompiled(addr string, test precompiledTest, t *testing.T) {
 func testPrecompiledOOG(addr string, test precompiledTest, t *testing.T) {
 	p := allPrecompiles[common.HexToAddress(addr)]
 	in := common.Hex2Bytes(test.Input)
-	gas := p.RequiredGas(in) - 1
+	gas := test.Gas - 1
 
 	t.Run(fmt.Sprintf("%s-Gas=%d", test.Name, gas), func(t *testing.T) {
 		_, _, err := RunPrecompiledContract(p, in, gas, nil)
@@ -175,15 +182,10 @@ func benchmarkPrecompiled(addr string, test precompiledTest, bench *testing.B) {
 		bench.ReportAllocs()
 
 		start := time.Now()
-
-		bench.ResetTimer()
-
-		for i := 0; i < bench.N; i++ {
+		for bench.Loop() {
 			copy(data, in)
 			res, _, err = RunPrecompiledContract(p, data, reqGas, nil)
 		}
-		bench.StopTimer()
-
 		elapsed := uint64(time.Since(start))
 		if elapsed < 1 {
 			elapsed = 1
@@ -271,6 +273,30 @@ func TestPrecompiledModExpOOG(t *testing.T) {
 	for _, test := range modexpTests {
 		testPrecompiledOOG("05", test, t)
 	}
+	modexpTestsEIP2565, err := loadJson("modexp_eip2565")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range modexpTestsEIP2565 {
+		testPrecompiledOOG("f5", test, t)
+	}
+	modexpTestsEIP7883, err := loadJson("modexp_eip7883")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range modexpTestsEIP7883 {
+		testPrecompiledOOG("f6", test, t)
+	}
+	gasCostTest := precompiledTest{
+		Input:       "000000000000000000000000000000000000000000000000000000000000082800000000000000000000000000000000000000000000000040000000000000090000000000000000000000000000000000000000000000000000000000000600000000adadadad00000000ff31ff00000006ffffffffffffffffffffffffffffffffffffffff0000000000000004ffffffffffffff0000000000000000000000000000000000000000d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0000001000200fefffeff01000100000000000000ffff01000100ffffffff01000100ffffffff0000050001000100fefffdff02000300ff000000000000012b000000000000090000000000000000000000000000000000000000000000000000ffffff000000000200fffffeff00000001000000000001000200fefffeff010001000000000000000000423034000000000011006161ffbf640053004f00ff00fffffffffffffff3ff00000000000f00002dffffffffff0000000000000000000061999999999999999999999999899961ffffffff0100010000000000000000000000000600000000adadadad00000000ffff00000006fffffdffffffffffffffffffffffffffffffffff0000000000000004ffffffffffffff000000000000000000000000000000000000000098000000966375726c2f66000030000000000011006161ffbf640053004f002d00000000a200000000000000ff1818183fffffffff3a6e756c6c2c22223a6e7500006c2000000000002d2d0000000000000000000144ccef0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000000000000fdff000000ff00290001000009000000000000000000000000000000000000000000000000a50004ff2800000000000000000000000000000000000000000000000001000000000000090000000000000000000000030000000000000000002b00000000000000000600000000adadadad00000000ffff00000006ffffffffffffffffffffffffffffffffffffffff0000000000000004ffffffffffffff0000000000000000000000000000000000000000d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000717a1a001a1a1a1a1a1a000000121212121212121212121212121212121212121212d0d0d0d01212121212121212121212121212121212121212121212121212121212121212121212121212121212121212373800002d35373837346137346161610000000000000000d0d0d0d0d0d0d0d0002d3533321a1a000000d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000717a1a001a1a1a1a1a1a000000121212121212121212121212121212121212121212d0d0d0d012121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121a1212121212121212000000000000000000000000d0d0d0d0d0d0d0d0002d3533321a1a0000000000000000000000003300000001000f5b00001100712c6eff9e61000000000061000000fbffff1a1a3a6e353900756c6c7d3b00000000009100002d35ff00600000000000000000002d3533321a1a1a1a3a6e353900756c6c7d3b000000000091373800002d3537383734613734616161d0d0d0d0d000000000717a1a001a1a1a1a1a1a000000121212121212121212121212121212121212121212d0d0d0d012121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121a1212121212121212000000000000000000000000d0d0d0d0d0d0d0d0002d3533321a1a0000000000000000000000003300000001000f5b00001100712c6eff9e61000000000061000000fbffff1a1a3a6e353900756c6c7d3b00000000009100002d35ff00600000000000000000002d3533321a1a1a1a3a6e353900756c6c7d3b000000000091373800002d353738373461373461616100000000000000000000000000000000000000000000000001000000000000090000000000000000000000030000000000000000002b00000000000000000600000000adadadad00000000ffff00000006ffffffffffffffffffffffffffffffffffffffff0000000000000004ffffffffffffff0000000000000000000000000000000000000000d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000717a1a001a1a1a1a1a1a000000121212121212121212121212121212121212121212d0d0d0d01212121212121212121212121212121212121212121212121212121212121212121212121212121212121212373800002d35373837346137346161610000000000000000d0d0d0d0d0d0d0d0002d3533321a1a000000d0d0d0d0d0d0d0d0d0d0d0d0d0d000000000717a1a001a1a1a1a1a1a000000121212121212121212121212121212121212121212d0d0d0d012121212121212121212121212121212121212121212121212121212121212121212121212121212121212121212121a1212121212121212000000000000000000000000d0d0d0d0d0d0d0d0002d3533321a1a0000000000000000000000003300000001000f5b00001100712c6eff9e61000000000061000000fbffff1a1a3a6e353900756c6c7d3b00000000009100002d35ff00600000000000000000002d3533321a1a1a1a3a6e353900756c6c7d3b000000000091373800002d3537383734613734616161d0d0d0d0d000000000717a1a001a1a1a1a1a1a0000001212121212121212121212121212121212121212000000000000003300000001000f5b00001100712c6eff9e61000000000061000000fbffff1a1a3a6e353900756c6c7d3b00000000009100002d35ff00600000000000000000002d3533321a1a1a1a3a6e353900756c6c7d3b000000000091373800002d3537383734613734616161",
+		Expected:    "000000000000000000000000000000000000000000000000",
+		Name:        "oss_fuzz_gas_calc",
+		Gas:         18446744073709551615,
+		NoBenchmark: false,
+	}
+	testPrecompiledOOG("05", gasCostTest, t)
+	testPrecompiledOOG("f5", gasCostTest, t)
+	testPrecompiledOOG("f6", gasCostTest, t)
 }
 
 // Tests the sample inputs from the elliptic curve scalar multiplication EIP 213.
@@ -334,6 +360,10 @@ func TestPrecompiledBLS12381G2MultiExp(t *testing.T) { testJson("blsG2MultiExp",
 func TestPrecompiledBLS12381Pairing(t *testing.T)    { testJson("blsPairing", "f0e", t) }
 func TestPrecompiledBLS12381MapG1(t *testing.T)      { testJson("blsMapG1", "f0f", t) }
 func TestPrecompiledBLS12381MapG2(t *testing.T)      { testJson("blsMapG2", "f10", t) }
+
+func TestPrecompiledPointEvaluation(t *testing.T) { testJson("pointEvaluation", "0a", t) }
+
+func BenchmarkPrecompiledPointEvaluation(b *testing.B) { benchJson("pointEvaluation", "0a", b) }
 
 func BenchmarkPrecompiledBLS12381G1Add(b *testing.B)      { benchJson("blsG1Add", "f0a", b) }
 func BenchmarkPrecompiledBLS12381G1MultiExp(b *testing.B) { benchJson("blsG1MultiExp", "f0b", b) }
@@ -427,31 +457,429 @@ func BenchmarkPrecompiledP256Verify(bench *testing.B) {
 		Expected: "0000000000000000000000000000000000000000000000000000000000000001",
 		Name:     "p256Verify",
 	}
-	benchmarkPrecompiled("100", t, bench)
+	benchmarkPrecompiled("0b", t, bench)
 }
 
 func TestPrecompiledP256Verify(t *testing.T) {
 	t.Parallel()
 
-	testJson("p256Verify", "100", t)
+	testJson("p256Verify", "0b", t)
 }
 
 // BOR: if this test failed, it means you should include PrecompiledP256Verify in the PrecompiledContracts
 // TODO: handle when common.BytesToAddress([]byte{0x01, 0x00}) will colide a new Ethereum's precompile
 func TestPrecompiledP256VerifyAlwaysAvailableInHFs(t *testing.T) {
-	latestHfRules := params.BorMainnetChainConfig.Rules(big.NewInt(math.MaxInt64), true, 0)
-	precompiledP256VerifyAddress := common.BytesToAddress([]byte{0x01, 0x00})
+	chainConfigs := []*params.ChainConfig{params.BorMainnetChainConfig, params.AmoyChainConfig}
+	for _, chainConfig := range chainConfigs {
+		latestHfRules := chainConfig.Rules(big.NewInt(math.MaxInt64), true, 0)
+		precompiledP256VerifyAddress := common.BytesToAddress([]byte{0x01, 0x00})
 
-	addresses := ActivePrecompiles(latestHfRules)
-	addressFound := false
-	for _, addr := range addresses {
-		if addr == precompiledP256VerifyAddress {
-			addressFound = true
-			break
+		addresses := ActivePrecompiles(latestHfRules)
+		addressFound := false
+		for _, addr := range addresses {
+			if addr == precompiledP256VerifyAddress {
+				addressFound = true
+				break
+			}
+		}
+		assert.Equal(t, true, addressFound)
+
+		preCompiledContracts := ActivePrecompiledContracts(latestHfRules)
+		_, ok := preCompiledContracts[precompiledP256VerifyAddress].(*p256Verify)
+		assert.Equal(t, true, ok)
+	}
+}
+
+// If this test failed, it likely means a new HF were introduced and is very likely that PreCompiles got changed (by introducing new ones, changing olds ones or removing).
+// Please follow the instructions here to properly handle this new HF
+//
+//  1. Make sure if p256Verify were properly set on this Hardfork, it was introduced by us in PIP-27
+//
+//  2. Double check all the changes on the preCompiles of the current HF and the new one.
+//     You should also pay attention for any params changes like in &bigModExp{eip2565: true, eip7823: true, eip7883: true}
+//     Make sure all changes reflects the Ethereum's new proposals while reflecting the changes we did internally. Currently just PIP-27
+//
+//  3. Check if Erigon reflects the exact same configuration for the PreCompiles, including also the same params for precompiles
+//
+//  4. Runs a e2e test which includes all the preCompiles in a single transaction. If a new preCompile were introduced, please reflect the new one on the tests
+//     The test must run on a multiclient network, including both Erigon and Bor. The test is available in our e2e repository.
+//
+//  5. After all checks done, you can increase insert the NewHF on the expected list to make the test pass
+func TestReinforceMultiClientPreCompilesTest(t *testing.T) {
+	rulesType := reflect.TypeOf(params.Rules{})
+
+	// Extract actual field names
+	actual := make([]string, 0, rulesType.NumField())
+	for i := 0; i < rulesType.NumField(); i++ {
+		actual = append(actual, rulesType.Field(i).Name)
+	}
+
+	// Expected field names (in order)
+	expected := []string{
+		"ChainID",
+		"IsHomestead",
+		"IsEIP150",
+		"IsEIP155",
+		"IsEIP158",
+		"IsEIP2929",
+		"IsEIP4762",
+		"IsByzantium",
+		"IsConstantinople",
+		"IsPetersburg",
+		"IsIstanbul",
+		"IsBerlin",
+		"IsLondon",
+		"IsMerge",
+		"IsShanghai",
+		"IsCancun",
+		"IsPrague",
+		"IsOsaka",
+		"IsVerkle",
+		"IsMadhugiri",
+		"IsMadhugiriPro",
+		"IsLisovo",
+		"IsLisovoPro",
+		"IsChicago",
+	}
+
+	if len(actual) != len(expected) {
+		t.Fatalf("A new hardfork were detected. Please read and follow the instruction on the comment section of this test")
+	}
+
+	// Compare names one-by-one for stability
+	for i := range expected {
+		if actual[i] != expected[i] {
+			t.Fatalf("A new hardfork were detected. Please read and follow the instruction on the comment section of this test")
 		}
 	}
-	assert.Equal(t, true, addressFound)
+}
 
-	preCompiledContracts := ActivePrecompiledContracts(latestHfRules)
-	assert.Equal(t, &p256Verify{}, preCompiledContracts[precompiledP256VerifyAddress])
+// TestLisovoP256VerifyGasCost verifies P256 precompile gas cost changes at Lisovo.
+func TestLisovoP256VerifyGasCost(t *testing.T) {
+	preLisovo := &p256Verify{eip7951: false}
+	postLisovo := &p256Verify{eip7951: true}
+
+	preGas := preLisovo.RequiredGas(nil)
+	postGas := postLisovo.RequiredGas(nil)
+
+	if preGas != params.P256VerifyGas {
+		t.Errorf("pre-Lisovo gas: got %d, want %d", preGas, params.P256VerifyGas)
+	}
+	if postGas != params.P256VerifyGasEIP7951 {
+		t.Errorf("post-Lisovo gas: got %d, want %d", postGas, params.P256VerifyGasEIP7951)
+	}
+	if preGas >= postGas {
+		t.Errorf("post-Lisovo gas (%d) should be higher than pre-Lisovo (%d)", postGas, preGas)
+	}
+}
+
+// TestLisovoCLZOpcode verifies CLZ opcode availability at Lisovo.
+func TestLisovoCLZOpcode(t *testing.T) {
+	preLisovo := newPragueInstructionSet()
+	postLisovo := newLisovoInstructionSet()
+
+	// Pre-Lisovo: CLZ should be undefined.
+	if preLisovo[CLZ].execute != nil && preLisovo[CLZ].constantGas != 0 {
+		t.Error("CLZ opcode should not be defined pre-Lisovo")
+	}
+
+	// Post-Lisovo: CLZ should be defined.
+	if postLisovo[CLZ].execute == nil {
+		t.Error("CLZ opcode should be defined post-Lisovo")
+	}
+	if postLisovo[CLZ].constantGas != GasFastStep {
+		t.Errorf("CLZ gas: got %d, want %d", postLisovo[CLZ].constantGas, GasFastStep)
+	}
+}
+
+// TestKZGPointEvaluationPrecompileRemoval verifies that the kzgPointEvaluation precompile
+// is present from Madhugiri through Lisovo, and is not present before Madhugiri and starting
+// with LisovoPro. Chicago should also not have kzgPointEvaluation precompile enabled.
+func TestKZGPointEvaluationPrecompileRemoval(t *testing.T) {
+	t.Parallel()
+
+	kzgPointEvaluationAddr := common.BytesToAddress([]byte{0x0a})
+	kzgPointEvaluationPrecompile := &kzgPointEvaluation{}
+
+	// We verify a few things in this test:
+	//   - Madhugiri, MadhugiriPro, and Lisovo have the kzg precompile enabled
+	//   - LisovoPro removes it, so it should not be enabled
+	//   - Chicago should not have kzgPointEvaluation precompile enabled
+	//   - Hard forks before Madhugiri (for example, Prague) should not have kzg enabled
+	type testCase struct {
+		name          string
+		rules         params.Rules
+		shouldHaveKzg bool
+	}
+	cases := []testCase{
+		{name: "Cancun (Pre-Madhugiri)", rules: params.Rules{IsCancun: true}, shouldHaveKzg: false},
+		{name: "Prague (Pre-Madhugiri)", rules: params.Rules{IsPrague: true}, shouldHaveKzg: false},
+		{name: "Madhugiri", rules: params.Rules{IsMadhugiri: true}, shouldHaveKzg: true},
+		{name: "MadhugiriPro", rules: params.Rules{IsMadhugiriPro: true}, shouldHaveKzg: true},
+		{name: "Lisovo", rules: params.Rules{IsLisovo: true}, shouldHaveKzg: true},
+		{name: "LisovoPro", rules: params.Rules{IsLisovoPro: true}, shouldHaveKzg: false},
+		{name: "Chicago", rules: params.Rules{IsChicago: true}, shouldHaveKzg: false},
+	}
+	for _, tc := range cases {
+		precompiles := ActivePrecompiledContracts(tc.rules)
+		pc, exists := precompiles[kzgPointEvaluationAddr]
+		if tc.shouldHaveKzg && !exists {
+			t.Errorf("kzgPointEvaluation (0x0a) should exist in %v precompiles", tc.name)
+		}
+		if !tc.shouldHaveKzg && exists {
+			t.Errorf("kzgPointEvaluation (0x0a) should not exist in %v precompiles", tc.name)
+		}
+		if exists && pc.Name() != kzgPointEvaluationPrecompile.Name() {
+			t.Errorf("invalid precompile loaded instead of kzgPointEvaluation (0x0a). expected name: %s, got name: %s, test case: %s", kzgPointEvaluationPrecompile.Name(), pc.Name(), tc.name)
+		}
+	}
+}
+
+// TestPIP88PrecompileGasCosts verifies pre- and post-PIP-88 gas for every
+// precompile repriced by the Chicago fork.
+func TestPIP88PrecompileGasCosts(t *testing.T) {
+	t.Parallel()
+
+	// blake2F input: 213 bytes, rounds=12 in big-endian uint32 at [0:4].
+	blake2FInput := make([]byte, 213)
+	blake2FInput[3] = 12
+
+	cases := []struct {
+		addr    byte
+		input   []byte
+		preGas  uint64
+		postGas uint64
+		name    string
+	}{
+		{0x06, nil, params.Bn256AddGasIstanbul, params.Bn256AddGasIstanbulPIP88, "bn256Add (3.6x)"},
+		{0x07, nil, params.Bn256ScalarMulGasIstanbul, params.Bn256ScalarMulGasIstanbulPIP88, "bn256ScalarMul (2.1x)"},
+		{0x0b, nil, params.Bls12381G1AddGas, params.Bls12381G1AddGasPIP88, "bls12381G1Add (2.8x)"},
+		{0x0d, nil, params.Bls12381G2AddGas, params.Bls12381G2AddGasPIP88, "bls12381G2Add (2.7x)"},
+		{0x10, nil, params.Bls12381MapG1Gas, params.Bls12381MapG1GasPIP88, "bls12381MapG1 (2.8x)"},
+		{0x11, nil, params.Bls12381MapG2Gas, params.Bls12381MapG2GasPIP88, "bls12381MapG2 (2.8x)"},
+		{
+			addr:    0x08,
+			input:   make([]byte, 192),
+			preGas:  params.Bn256PairingBaseGasIstanbul + params.Bn256PairingPerPointGasIstanbul,
+			postGas: params.Bn256PairingBaseGasIstanbulPIP88 + params.Bn256PairingPerPointGasIstanbulPIP88,
+			name:    "bn256Pairing k=1 (1.5x)",
+		},
+		{
+			addr:    0x0f,
+			input:   make([]byte, 384),
+			preGas:  params.Bls12381PairingBaseGas + params.Bls12381PairingPerPairGas,
+			postGas: params.Bls12381PairingBaseGasPIP88 + params.Bls12381PairingPerPairGasPIP88,
+			name:    "bls12381Pairing k=1 (2.9x)",
+		},
+		// MSM at k=1: discount table[0]=1000, so gas = mulGas.
+		{0x0c, make([]byte, 160), params.Bls12381G1MulGas, params.Bls12381G1MulGasPIP88, "bls12381G1MultiExp k=1 (6.1x)"},
+		{0x0e, make([]byte, 288), params.Bls12381G2MulGas, params.Bls12381G2MulGasPIP88, "bls12381G2MultiExp k=1 (6.4x)"},
+		{0x09, blake2FInput, 12, 12 * params.GFROUNDPIP88, "blake2F rounds=12 (22x)"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := common.BytesToAddress([]byte{tc.addr})
+
+			pre, ok := PrecompiledContractsLisovoPro[addr]
+			if !ok {
+				t.Fatalf("0x%02x missing from PrecompiledContractsLisovoPro", tc.addr)
+			}
+			post, ok := PrecompiledContractsChicago[addr]
+			if !ok {
+				t.Fatalf("0x%02x missing from PrecompiledContractsChicago", tc.addr)
+			}
+
+			if got := pre.RequiredGas(tc.input); got != tc.preGas {
+				t.Errorf("pre-PIP-88 gas: got %d, want %d", got, tc.preGas)
+			}
+			if got := post.RequiredGas(tc.input); got != tc.postGas {
+				t.Errorf("post-PIP-88 gas: got %d, want %d", got, tc.postGas)
+			}
+		})
+	}
+}
+
+// TestPIP88SStoreGas walks every branch of makeGasSStoreFuncPIP88 and verifies
+// the gas charged and refund-pool delta match closed-form values.
+func TestPIP88SStoreGas(t *testing.T) {
+	t.Parallel()
+
+	addr := common.Address{0xaa}
+	slot := common.BigToHash(big.NewInt(1))
+	val42 := common.BigToHash(big.NewInt(0x42))
+	val99 := common.BigToHash(big.NewInt(0x99))
+
+	cases := []struct {
+		name            string
+		original        common.Hash // committed value before this tx
+		current         common.Hash // dirty value (only applied if != original)
+		value           common.Hash // value being written by SSTORE
+		warm            bool
+		wantGas         uint64
+		wantRefundDelta int64
+	}{
+		{
+			name:     "cold reset existing slot (EIP-2929 invariant: total = 5000)",
+			original: val42, current: val42, value: val99, warm: false,
+			wantGas: params.SstoreResetGasEIP2200, wantRefundDelta: 0,
+		},
+		{
+			name:     "warm reset existing slot",
+			original: val42, current: val42, value: val99, warm: true,
+			wantGas: params.SstoreResetGasEIP2200 - params.ColdSstoreCostPIP88, wantRefundDelta: 0,
+		},
+		{
+			name:     "cold create slot",
+			original: common.Hash{}, current: common.Hash{}, value: val99, warm: false,
+			wantGas: params.ColdSstoreCostPIP88 + params.SstoreSetGasEIP2200, wantRefundDelta: 0,
+		},
+		{
+			name:     "cold delete clean slot (clearingRefund = SstoreClearsScheduleRefundPIP88)",
+			original: val42, current: val42, value: common.Hash{}, warm: false,
+			wantGas:         params.SstoreResetGasEIP2200,
+			wantRefundDelta: int64(params.SstoreClearsScheduleRefundPIP88),
+		},
+		{
+			name:     "cold noop (current == value)",
+			original: val42, current: val42, value: val42, warm: false,
+			wantGas: params.ColdSstoreCostPIP88 + params.WarmStorageReadCostEIP2929, wantRefundDelta: 0,
+		},
+		{
+			name:     "reset to original existing slot (refund = (RESET - cold) - warm)",
+			original: val42, current: val99, value: val42, warm: true,
+			wantGas:         params.WarmStorageReadCostEIP2929,
+			wantRefundDelta: int64((params.SstoreResetGasEIP2200 - params.ColdSstoreCostPIP88) - params.WarmStorageReadCostEIP2929),
+		},
+		{
+			name:     "reset to clean zero (refund = SstoreSet - warm, unchanged from EIP-3529)",
+			original: common.Hash{}, current: val99, value: common.Hash{}, warm: true,
+			wantGas:         params.WarmStorageReadCostEIP2929,
+			wantRefundDelta: int64(params.SstoreSetGasEIP2200 - params.WarmStorageReadCostEIP2929),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			statedb.CreateAccount(addr)
+
+			// Move dirty storage to pending so it appears as the "original"
+			// (committed) value. Finalise(false) skips empty-object deletion;
+			// using `true` would drop our account since it has no balance/code.
+			if tc.original != (common.Hash{}) {
+				statedb.SetState(addr, slot, tc.original)
+				statedb.Finalise(false)
+			}
+			if tc.current != tc.original {
+				statedb.SetState(addr, slot, tc.current)
+			}
+			if tc.warm {
+				statedb.AddSlotToAccessList(addr, slot)
+			}
+
+			evm := NewEVM(
+				BlockContext{BlockNumber: big.NewInt(1), Time: 1, Random: &common.Hash{}},
+				statedb, params.MergedTestChainConfig, Config{},
+			)
+			contract := NewContract(common.Address{}, addr, uint256.NewInt(0), 1_000_000, nil)
+
+			stack := newstack()
+			stack.push(new(uint256.Int).SetBytes(tc.value.Bytes())) // Back(1) = value
+			stack.push(new(uint256.Int).SetBytes(slot.Bytes()))     // peek = slot
+
+			refundBefore := statedb.GetRefund()
+			gas, err := gasSStorePIP88(evm, contract, stack, NewMemory(), 0)
+			if err != nil {
+				t.Fatalf("gasSStorePIP88 returned error: %v", err)
+			}
+			refundDelta := int64(statedb.GetRefund()) - int64(refundBefore)
+
+			if gas != tc.wantGas {
+				t.Errorf("gas: got %d, want %d", gas, tc.wantGas)
+			}
+			if refundDelta != tc.wantRefundDelta {
+				t.Errorf("refund delta: got %d, want %d", refundDelta, tc.wantRefundDelta)
+			}
+		})
+	}
+}
+
+// TestPIP88ForkBoundary verifies that the Chicago fork dispatch flips at the
+// configured block: precompile set and SLOAD instruction-set gas function both
+// switch from EIP-3529/LisovoPro to PIP-88 at block N (with N-1 still old).
+func TestPIP88ForkBoundary(t *testing.T) {
+	t.Parallel()
+
+	const chicagoBlock = 100
+
+	// Clone MergedTestChainConfig and push Chicago to a specific block so we
+	// have a real boundary to test against.
+	cfg := *params.MergedTestChainConfig
+	borCfg := *cfg.Bor
+	borCfg.ChicagoBlock = big.NewInt(chicagoBlock)
+	cfg.Bor = &borCfg
+
+	addr := common.Address{0xaa}
+	slot := common.BigToHash(big.NewInt(1))
+
+	cases := []struct {
+		name             string
+		block            int64
+		wantIsChicago    bool
+		wantBn256AddGas  uint64 // probe for ActivePrecompiledContracts dispatch
+		wantColdSloadGas uint64 // probe for LookupInstructionSet dispatch
+	}{
+		{
+			name:             "block N-1 (pre-Chicago)",
+			block:            chicagoBlock - 1,
+			wantIsChicago:    false,
+			wantBn256AddGas:  params.Bn256AddGasIstanbul,
+			wantColdSloadGas: params.ColdSloadCostEIP2929,
+		},
+		{
+			name:             "block N (Chicago active)",
+			block:            chicagoBlock,
+			wantIsChicago:    true,
+			wantBn256AddGas:  params.Bn256AddGasIstanbulPIP88,
+			wantColdSloadGas: params.ColdSloadCostPIP88,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rules := cfg.Rules(big.NewInt(tc.block), false, 0)
+			if rules.IsChicago != tc.wantIsChicago {
+				t.Fatalf("rules.IsChicago: got %v, want %v", rules.IsChicago, tc.wantIsChicago)
+			}
+
+			// Precompile dispatch probe.
+			bn256Add := ActivePrecompiledContracts(rules)[common.BytesToAddress([]byte{0x06})]
+			if got := bn256Add.RequiredGas(nil); got != tc.wantBn256AddGas {
+				t.Errorf("bn256Add gas via ActivePrecompiledContracts: got %d, want %d", got, tc.wantBn256AddGas)
+			}
+
+			// Instruction-set dispatch probe via SLOAD's dynamicGas on a cold slot.
+			jt, err := LookupInstructionSet(rules)
+			if err != nil {
+				t.Fatalf("LookupInstructionSet: %v", err)
+			}
+			statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+			evm := NewEVM(
+				BlockContext{BlockNumber: big.NewInt(tc.block), Time: 1, Random: &common.Hash{}},
+				statedb, &cfg, Config{},
+			)
+			contract := NewContract(common.Address{}, addr, uint256.NewInt(0), 1_000_000, nil)
+			stack := newstack()
+			stack.push(new(uint256.Int).SetBytes(slot.Bytes()))
+
+			gas, err := jt[SLOAD].dynamicGas(evm, contract, stack, NewMemory(), 0)
+			if err != nil {
+				t.Fatalf("SLOAD dynamicGas: %v", err)
+			}
+			if gas != tc.wantColdSloadGas {
+				t.Errorf("cold SLOAD gas via LookupInstructionSet: got %d, want %d", gas, tc.wantColdSloadGas)
+			}
+		})
+	}
 }

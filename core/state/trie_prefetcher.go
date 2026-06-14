@@ -19,6 +19,7 @@ package state
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -46,6 +47,7 @@ type triePrefetcher struct {
 	fetchers map[string]*subfetcher // Subfetchers for each trie
 	term     chan struct{}          // Channel to signal interruption
 	noreads  bool                   // Whether to ignore state-read-only prefetch requests
+	ioSem    chan struct{}          // Limits concurrent trie I/O to avoid starving execution
 
 	deliveryMissMeter *metrics.Meter
 
@@ -63,6 +65,9 @@ type triePrefetcher struct {
 	storageDupCrossMeter  *metrics.Meter
 	storageWasteMeter     *metrics.Meter
 
+	accountFetchTimer *metrics.ResettingTimer
+	storageFetchTimer *metrics.ResettingTimer
+
 	lock sync.RWMutex // Use RWMutex for better read/write locking
 }
 
@@ -75,6 +80,7 @@ func newTriePrefetcher(db Database, root common.Hash, namespace string, noreads 
 		fetchers: make(map[string]*subfetcher), // Active prefetchers use the fetchers map
 		term:     make(chan struct{}),
 		noreads:  noreads,
+		ioSem:    nil, // No rate limiting — total I/O is the same regardless
 
 		deliveryMissMeter: metrics.GetOrRegisterMeter(prefix+"/deliverymiss", nil),
 
@@ -91,6 +97,9 @@ func newTriePrefetcher(db Database, root common.Hash, namespace string, noreads 
 		storageDupWriteMeter:  metrics.GetOrRegisterMeter(prefix+"/storage/dup/write", nil),
 		storageDupCrossMeter:  metrics.GetOrRegisterMeter(prefix+"/storage/dup/cross", nil),
 		storageWasteMeter:     metrics.GetOrRegisterMeter(prefix+"/storage/waste", nil),
+
+		accountFetchTimer: metrics.GetOrRegisterResettingTimer(prefix+"/account/fetch", nil),
+		storageFetchTimer: metrics.GetOrRegisterResettingTimer(prefix+"/storage/fetch", nil),
 	}
 }
 
@@ -122,9 +131,18 @@ func (p *triePrefetcher) report() {
 	if !metrics.Enabled() {
 		return
 	}
+	var accountFetchTime time.Duration
+	var maxStorageFetchTime time.Duration
 	for _, fetcher := range p.fetchers {
 		fetcher.wait() // ensure the fetcher's idle before poking in its internals
 
+		if fetcher.root == p.root {
+			accountFetchTime = fetcher.fetchTime
+		} else if fetcher.fetchTime > maxStorageFetchTime {
+			maxStorageFetchTime = fetcher.fetchTime
+		}
+
+		fetcher.usedLock.Lock()
 		if fetcher.root == p.root {
 			p.accountLoadReadMeter.Mark(int64(len(fetcher.seenReadAddr)))
 			p.accountLoadWriteMeter.Mark(int64(len(fetcher.seenWriteAddr)))
@@ -152,7 +170,10 @@ func (p *triePrefetcher) report() {
 			}
 			p.storageWasteMeter.Mark(int64(len(fetcher.seenReadSlot) + len(fetcher.seenWriteSlot)))
 		}
+		fetcher.usedLock.Unlock()
 	}
+	p.accountFetchTimer.Update(accountFetchTime)
+	p.storageFetchTimer.Update(maxStorageFetchTime)
 }
 
 // prefetch schedules a batch of trie items to prefetch. After the prefetcher is
@@ -184,7 +205,7 @@ func (p *triePrefetcher) prefetch(owner common.Hash, root common.Hash, addr comm
 
 	fetcher := p.fetchers[id]
 	if fetcher == nil {
-		fetcher = newSubfetcher(p.db, p.root, owner, root, addr)
+		fetcher = newSubfetcher(p.db, p.root, owner, root, addr, p.ioSem)
 		p.fetchers[id] = fetcher
 	}
 	return fetcher.schedule(addrs, slots, read)
@@ -200,7 +221,7 @@ func (p *triePrefetcher) trie(owner common.Hash, root common.Hash) Trie {
 	// Bail if no trie was prefetched for this root
 	fetcher := p.fetchers[p.trieID(owner, root)]
 	if fetcher == nil {
-		log.Error("Prefetcher missed to load trie", "owner", owner, "root", root)
+		log.Debug("Prefetcher missed to load trie", "owner", owner, "root", root)
 		p.deliveryMissMeter.Mark(1)
 		return nil
 	}
@@ -211,14 +232,12 @@ func (p *triePrefetcher) trie(owner common.Hash, root common.Hash) Trie {
 // used marks a batch of state items used to allow creating statistics as to
 // how useful or wasteful the fetcher is.
 func (p *triePrefetcher) used(owner common.Hash, root common.Hash, usedAddr []common.Address, usedSlot []common.Hash) {
-	p.lock.Lock()         // Lock for writing
-	defer p.lock.Unlock() // Ensure the lock is released after the function
+	p.lock.RLock()
+	fetcher := p.fetchers[p.trieID(owner, root)]
+	p.lock.RUnlock()
 
-	if fetcher := p.fetchers[p.trieID(owner, root)]; fetcher != nil {
-		fetcher.wait() // ensure the fetcher's idle before poking in its internals
-
-		fetcher.usedAddr = append(fetcher.usedAddr, usedAddr...)
-		fetcher.usedSlot = append(fetcher.usedSlot, usedSlot...)
+	if fetcher != nil {
+		fetcher.appendUsed(usedAddr, usedSlot)
 	}
 }
 
@@ -247,6 +266,7 @@ type subfetcher struct {
 	root  common.Hash    // Root hash of the trie to prefetch
 	addr  common.Address // Address of the account that the trie belongs to
 	trie  Trie           // Trie being populated with nodes
+	ioSem chan struct{}  // Shared semaphore limiting concurrent trie I/O
 
 	tasks []*subfetcherTask // Items queued up for retrieval
 	lock  sync.Mutex        // Lock protecting the task queue
@@ -266,6 +286,9 @@ type subfetcher struct {
 
 	usedAddr []common.Address // Tracks the accounts used in the end
 	usedSlot []common.Hash    // Tracks the storage used in the end
+	usedLock sync.Mutex       // Lock protecting usedAddr/usedSlot appends
+
+	fetchTime time.Duration // Cumulative time spent in PrefetchAccount/PrefetchStorage
 }
 
 // subfetcherTask is a trie path to prefetch, tagged with whether it originates
@@ -278,13 +301,28 @@ type subfetcherTask struct {
 
 // newSubfetcher creates a goroutine to prefetch state items belonging to a
 // particular root hash.
-func newSubfetcher(db Database, state common.Hash, owner common.Hash, root common.Hash, addr common.Address) *subfetcher {
+// withIO runs fn while holding the optional shared I/O semaphore (nil-safe)
+// and adds the elapsed time to fetchTime. The semaphore caps concurrent
+// trie I/O across subfetchers so prefetcher activity doesn't starve the
+// main execution path.
+func (sf *subfetcher) withIO(fn func()) {
+	if sf.ioSem != nil {
+		sf.ioSem <- struct{}{}
+		defer func() { <-sf.ioSem }()
+	}
+	start := time.Now()
+	fn()
+	sf.fetchTime += time.Since(start)
+}
+
+func newSubfetcher(db Database, state common.Hash, owner common.Hash, root common.Hash, addr common.Address, ioSem chan struct{}) *subfetcher {
 	sf := &subfetcher{
 		db:            db,
 		state:         state,
 		owner:         owner,
 		root:          root,
 		addr:          addr,
+		ioSem:         ioSem,
 		wake:          make(chan struct{}, 1),
 		stop:          make(chan struct{}),
 		term:          make(chan struct{}),
@@ -330,6 +368,19 @@ func (sf *subfetcher) schedule(addrs []common.Address, slots []common.Hash, read
 // an async termination before accessing internal fields from the fetcher.
 func (sf *subfetcher) wait() {
 	<-sf.term
+}
+
+// appendUsed records which state items were actually consumed. This is called
+// concurrently from IntermediateRoot goroutines (each targeting a different
+// subfetcher), so it uses a per-subfetcher lock instead of the global
+// triePrefetcher lock to avoid serializing independent updates.
+func (sf *subfetcher) appendUsed(addrs []common.Address, slots []common.Hash) {
+	sf.wait() // ensure the fetcher's idle before poking in its internals
+
+	sf.usedLock.Lock()
+	sf.usedAddr = append(sf.usedAddr, addrs...)
+	sf.usedSlot = append(sf.usedSlot, slots...)
+	sf.usedLock.Unlock()
 }
 
 // peek retrieves the fetcher's trie, populated with any pre-fetched data. The
@@ -407,6 +458,10 @@ func (sf *subfetcher) loop() {
 			sf.tasks = nil
 			sf.lock.Unlock()
 
+			var (
+				addresses []common.Address
+				slots     [][]byte
+			)
 			for _, task := range tasks {
 				if task.addr != nil {
 					key := *task.addr
@@ -419,6 +474,7 @@ func (sf *subfetcher) loop() {
 							sf.dupsCross++
 							continue
 						}
+						sf.seenReadAddr[key] = struct{}{}
 					} else {
 						if _, ok := sf.seenReadAddr[key]; ok {
 							sf.dupsCross++
@@ -428,7 +484,9 @@ func (sf *subfetcher) loop() {
 							sf.dupsWrite++
 							continue
 						}
+						sf.seenWriteAddr[key] = struct{}{}
 					}
+					addresses = append(addresses, *task.addr)
 				} else {
 					key := *task.slot
 					if task.read {
@@ -440,6 +498,7 @@ func (sf *subfetcher) loop() {
 							sf.dupsCross++
 							continue
 						}
+						sf.seenReadSlot[key] = struct{}{}
 					} else {
 						if _, ok := sf.seenReadSlot[key]; ok {
 							sf.dupsCross++
@@ -449,26 +508,24 @@ func (sf *subfetcher) loop() {
 							sf.dupsWrite++
 							continue
 						}
+						sf.seenWriteSlot[key] = struct{}{}
 					}
+					slots = append(slots, key.Bytes())
 				}
-				if task.addr != nil {
-					sf.trie.GetAccount(*task.addr)
-				} else {
-					sf.trie.GetStorage(sf.addr, (*task.slot)[:])
-				}
-				if task.read {
-					if task.addr != nil {
-						sf.seenReadAddr[*task.addr] = struct{}{}
-					} else {
-						sf.seenReadSlot[*task.slot] = struct{}{}
+			}
+			if len(addresses) != 0 {
+				sf.withIO(func() {
+					if err := sf.trie.PrefetchAccount(addresses); err != nil {
+						log.Error("Failed to prefetch accounts", "err", err)
 					}
-				} else {
-					if task.addr != nil {
-						sf.seenWriteAddr[*task.addr] = struct{}{}
-					} else {
-						sf.seenWriteSlot[*task.slot] = struct{}{}
+				})
+			}
+			if len(slots) != 0 {
+				sf.withIO(func() {
+					if err := sf.trie.PrefetchStorage(sf.addr, slots); err != nil {
+						log.Error("Failed to prefetch storage", "err", err)
 					}
-				}
+				})
 			}
 
 		case <-sf.stop:

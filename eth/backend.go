@@ -54,6 +54,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/eth/protocols/wit"
+	"github.com/ethereum/go-ethereum/eth/relay"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -152,11 +153,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, fmt.Errorf("invalid history mode %d", config.HistoryMode)
 	}
 
-	// PIP-35: Enforce min gas price to 25 gwei
-	if config.Miner.GasPrice == nil || config.Miner.GasPrice.Cmp(big.NewInt(params.BorDefaultMinerGasPrice)) != 0 {
+	if config.Miner.GasPrice == nil {
+		log.Info("Miner gas price not set, using default", "value", params.BorDefaultMinerGasPrice)
+		config.Miner.GasPrice = big.NewInt(params.BorDefaultMinerGasPrice)
+	}
+	// PIP-35: Enforce min gas price to 25 gwei only if gas tip override is not allowed
+	if !config.Miner.AllowGasTipOverride && config.Miner.GasPrice.Cmp(big.NewInt(params.BorDefaultMinerGasPrice)) != 0 {
 		log.Warn("Sanitizing invalid miner gas price", "provided", config.Miner.GasPrice, "updated", ethconfig.Defaults.Miner.GasPrice)
 		config.Miner.GasPrice = ethconfig.Defaults.Miner.GasPrice
 	}
+	if config.Miner.AllowGasTipOverride {
+		log.Info("Setting miner gas price", "value", config.Miner.GasPrice)
+	}
+
 	if config.NoPruning && config.TrieDirtyCache > 0 && config.StateScheme == rawdb.HashScheme {
 		if config.SnapshotCache > 0 {
 			config.TrieCleanCache += config.TrieDirtyCache * 3 / 5
@@ -187,6 +196,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		WitnessPruneEnabled: witnessPruneEnabled,
 		BlockPruneEnabled:   blockPruneEnabled,
 		Stateless:           config.SyncMode == downloader.StatelessSync,
+		WitnessFileStore:    config.WitnessFileStore,
 	}
 	chainDb, err := stack.OpenDatabaseWithOptions("chaindata", dbOptions)
 	if err != nil {
@@ -220,17 +230,52 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		closeCh:         make(chan struct{}),
 	}
 
+	relayService := relay.Init(config.EnablePreconfs, config.EnablePrivateTx, config.AcceptPreconfTx, config.AcceptPrivateTx, config.BlockProducerRpcEndpoints)
+	privateTxGetter := relayService.GetPrivateTxGetter()
+
 	// START: Bor changes
-	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil}
+	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil, relayService}
 	if eth.APIBackend.allowUnprotectedTxs {
-		log.Info("------Unprotected transactions allowed-------")
+		log.Info("Unprotected transactions allowed")
 		config.TxPool.AllowUnprotectedTxs = true
 	}
 
-	gpoParams := config.GPO
+	// Set transaction getter for relay service to query local database
+	relayService.SetTxGetter(eth.APIBackend.GetCanonicalTransaction)
 
 	blockChainAPI := ethapi.NewBlockChainAPI(eth.APIBackend)
-	engine, err := ethconfig.CreateConsensusEngine(config.Genesis.Config, config, chainDb, blockChainAPI)
+
+	// Prepare the vm config for tracing
+	vmCfg := vm.Config{
+		EnablePreimageRecording: config.EnablePreimageRecording,
+		StatelessSelfValidation: config.StatelessSelfValidation,
+		EnableWitnessStats:      config.EnableWitnessStats,
+		EnableEVMSwitchDispatch: config.EnableEVMSwitchDispatch,
+	}
+
+	// Setup live tracer if requested
+	if config.VMTrace != "" && config.ParallelEVM.Enable {
+		log.Warn("Live tracing requested but not supported with ParallelEVM enabled. Disable ParallelEVM via `--parallelevm.enable=false` to use live tracing.")
+	} else if config.VMTrace != "" {
+		traceConfig := json.RawMessage("{}")
+		if config.VMTraceJsonConfig != "" {
+			traceConfig = json.RawMessage(config.VMTraceJsonConfig)
+		}
+		t, err := tracers.LiveDirectory.New(config.VMTrace, traceConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create tracer %s: %v", config.VMTrace, err)
+		}
+		// For tracing state-sync transactions, we need a modified tracer. We wrap the hooks
+		// of the live tracer above with a state-sync aware tracer which is used across multiple
+		// modules.
+		if borCfg := config.Genesis.Config.Bor; borCfg != nil {
+			stateReceiver := common.HexToAddress(borCfg.StateReceiverContract)
+			t = tracers.WrapStateSyncHooks(t, stateReceiver)
+		}
+		vmCfg.Tracer = t
+	}
+
+	engine, err := ethconfig.CreateConsensusEngine(config.Genesis.Config, config, chainDb, blockChainAPI, vmCfg)
 	eth.engine = engine
 	if err != nil {
 		return nil, err
@@ -255,37 +300,37 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			rawdb.WriteDatabaseVersion(chainDb, core.BlockChainVersion)
 		}
 	}
-	options := &core.BlockChainConfig{
-		TrieCleanLimit:    config.TrieCleanCache,
-		NoPrefetch:        config.NoPrefetch,
-		TrieDirtyLimit:    config.TrieDirtyCache,
-		ArchiveMode:       config.NoPruning,
-		TrieTimeLimit:     config.TrieTimeout,
-		SnapshotLimit:     config.SnapshotCache,
-		Preimages:         config.Preimages,
-		StateHistory:      config.StateHistory,
-		StateScheme:       scheme,
-		TriesInMemory:     config.TriesInMemory,
-		ChainHistoryMode:  config.HistoryMode,
-		TxLookupLimit:     int64(min(config.TransactionHistory, math.MaxInt64)),
-		AddressCacheSizes: config.AddressCacheSizes,
-		VmConfig: vm.Config{
-			EnablePreimageRecording: config.EnablePreimageRecording,
-		},
-		Stateless: config.SyncMode == downloader.StatelessSync,
+	trieJournalDirectory := config.TrieJournalDirectory
+	if trieJournalDirectory == "" {
+		trieJournalDirectory = stack.ResolvePath("triedb")
 	}
 
-	if config.VMTrace != "" {
-		traceConfig := json.RawMessage("{}")
-		if config.VMTraceJsonConfig != "" {
-			traceConfig = json.RawMessage(config.VMTraceJsonConfig)
+	var (
+		options = &core.BlockChainConfig{
+			TrieCleanLimit:    config.TrieCleanCache,
+			NoPrefetch:        config.NoPrefetch,
+			TrieDirtyLimit:    config.TrieDirtyCache,
+			ArchiveMode:       config.NoPruning,
+			TrieTimeLimit:     config.TrieTimeout,
+			SnapshotLimit:     config.SnapshotCache,
+			Preimages:         config.Preimages,
+			StateHistory:      config.StateHistory,
+			StateScheme:       scheme,
+			TriesInMemory:     config.TriesInMemory,
+			ChainHistoryMode:  config.HistoryMode,
+			TxLookupLimit:     int64(min(config.TransactionHistory, math.MaxInt64)),
+			AddressCacheSizes: config.AddressCacheSizes,
+			PreloadRateLimit:  config.PreloadRateLimit,
+			VmConfig:          vmCfg,
+			Stateless:         config.SyncMode == downloader.StatelessSync,
+			// Enables file journaling for the trie database. The journal files will be stored
+			// within the data directory. The corresponding paths will be either:
+			// - DATADIR/triedb/merkle.journal
+			// - DATADIR/triedb/verkle.journal
+			TrieJournalDirectory: trieJournalDirectory,
+			StateSizeTracking:    config.EnableStateSizeTracking,
 		}
-		t, err := tracers.LiveDirectory.New(config.VMTrace, traceConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create tracer %s: %v", config.VMTrace, err)
-		}
-		options.VmConfig.Tracer = t
-	}
+	)
 
 	checker := whitelist.NewService(chainDb, config.DisableBlindForkValidation, config.MaxBlindForkValidationLimit)
 
@@ -299,6 +344,18 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	options.Overrides = &overrides
+	options.Checker = checker
+
+	// Wire MilestoneFetcher so verifyPendingHeaders queries Heimdall directly.
+	if borEngine, ok := eth.engine.(*bor.Bor); ok && borEngine.HeimdallClient != nil {
+		options.MilestoneFetcher = func(ctx context.Context) (uint64, error) {
+			m, err := borEngine.HeimdallClient.FetchMilestone(ctx)
+			if err != nil {
+				return 0, err
+			}
+			return m.EndBlock, nil
+		}
+	}
 
 	// check if Parallel EVM is enabled
 	// if enabled, use parallel state processor
@@ -307,6 +364,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	} else {
 		eth.blockchain, err = core.NewBlockChain(chainDb, config.Genesis, eth.engine, options)
 	}
+
+	// Set the chain head event subscription function for private tx store
+	relayService.SetchainEventSubFn(eth.blockchain.SubscribeChainEvent)
 
 	// Set parallel stateless import toggle on blockchain
 	if err == nil && eth.blockchain != nil && config.EnableParallelStatelessImport {
@@ -322,18 +382,6 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	// Set blockchain reference for fork detection in whitelist service
 	checker.SetBlockchain(eth.blockchain)
-
-	// 1.14.8: NewOracle function definition was changed to accept (startPrice *big.Int) param.
-	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, gpoParams, config.Miner.GasPrice)
-
-	// bor: this is nor present in geth
-	/*
-		_ = eth.engine.VerifyHeader(eth.blockchain, eth.blockchain.CurrentHeader()) // TODO think on it
-	*/
-
-	// BOR changes
-	eth.APIBackend.gpo.ProcessCache()
-	// BOR changes
 
 	// Initialize filtermaps log index.
 	fmConfig := filtermaps.Config{
@@ -359,6 +407,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		config.BlobPool.Datadir = stack.ResolvePath(config.BlobPool.Datadir)
 	}
 
+	// TxPool
 	if config.TxPool.Journal != "" {
 		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
 	}
@@ -374,11 +423,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		// The `config.TxPool.PriceLimit` used above doesn't reflect the sanitized/enforced changes
 		// made in the txpool. Update the `gasTip` explicitly to reflect the enforced value.
 		eth.txPool.SetGasTip(new(big.Int).SetUint64(params.BorDefaultTxPoolPriceLimit))
-	}
 
-	// The `config.TxPool.PriceLimit` used above doesn't reflect the sanitized/enforced changes
-	// made in the txpool. Update the `gasTip` explicitly to reflect the enforced value.
-	eth.txPool.SetGasTip(new(big.Int).SetUint64(params.BorDefaultTxPoolPriceLimit))
+		// Allow private tx store to check if txs are still in the pool for cleanup
+		relayService.SetTxPoolChecker(eth.txPool.Has)
+	}
 
 	if !config.TxPool.NoLocals {
 		rejournal := config.TxPool.Rejournal
@@ -403,13 +451,17 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		EventMux:                eth.eventMux,
 		RequiredBlocks:          config.RequiredBlocks,
 		EthAPI:                  blockChainAPI,
+		gasCeil:                 config.Miner.GasCeil,
 		checker:                 checker,
 		enableBlockTracking:     eth.config.EnableBlockTracking,
 		txAnnouncementOnly:      eth.p2pServer.TxAnnouncementOnly,
+		disableTxPropagation:    eth.p2pServer.DisableTxPropagation,
 		witnessProtocol:         eth.config.WitnessProtocol,
 		syncWithWitnesses:       eth.config.SyncWithWitnesses,
 		syncAndProduceWitnesses: eth.config.SyncAndProduceWitnesses,
 		fastForwardThreshold:    config.FastForwardThreshold,
+		p2pServer:               eth.p2pServer,
+		privateTxGetter:         privateTxGetter,
 	}); err != nil {
 		return nil, err
 	}
@@ -422,12 +474,9 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		eth.miner.SetPrioAddresses(config.TxPool.Locals)
 	}
 
-	eth.APIBackend = &EthAPIBackend{stack.Config().ExtRPCEnabled(), stack.Config().AllowUnprotectedTxs, eth, nil}
-	if eth.APIBackend.allowUnprotectedTxs {
-		log.Info("Unprotected transactions allowed")
-	}
 	// 1.14.8: NewOracle function definition was changed to accept (startPrice *big.Int) param.
 	eth.APIBackend.gpo = gasprice.NewOracle(eth.APIBackend, config.GPO, config.Miner.GasPrice)
+	eth.APIBackend.gpo.ProcessCache()
 
 	// Start the RPC service
 	eth.netRPCService = ethapi.NewNetAPI(eth.p2pServer, config.NetworkId)
@@ -476,7 +525,11 @@ func (s *Ethereum) APIs() []rpc.API {
 	apis = append(apis, s.engine.APIs(s.BlockChain())...)
 
 	// BOR change starts
-	filterSystem := filters.NewFilterSystem(s.APIBackend, filters.Config{})
+	filterSystem := filters.NewFilterSystem(s.APIBackend, filters.Config{
+		LogCacheSize:  s.config.FilterLogCacheSize,
+		LogQueryLimit: s.config.LogQueryLimit,
+		RangeLimit:    s.config.RPCBlockRangeLimit,
+	})
 	// set genesis to public filter api
 	publicFilterAPI := filters.NewFilterAPI(filterSystem, s.config.BorLogs)
 	// avoiding constructor changed by introducing new method to set genesis
@@ -667,7 +720,12 @@ func (s *Ethereum) SetAuthorized(authorized bool) {
 // network protocols to start.
 func (s *Ethereum) Protocols() []p2p.Protocol {
 	protos := eth.MakeProtocols((*ethHandler)(s.handler), s.networkID, s.discmix)
-	if s.config.SnapshotCache > 0 {
+	// snap/1 is only registered when the snapshot cache is enabled and NoSnapServing is false.
+	// Setting NoSnapServing=true disables snap/1 entirely: the node will neither serve snap sync
+	// requests nor be able to sync state via snap/1 itself. The in-memory snapshot tree (used for
+	// fast local state reads) remains active regardless. Nodes that need to snap sync from peers
+	// must leave NoSnapServing=false (the default).
+	if s.config.SnapshotCache > 0 && !s.config.NoSnapServing {
 		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler))...)
 	}
 	if s.config.WitnessProtocol {
@@ -687,7 +745,7 @@ func (s *Ethereum) Start() error {
 	// Regularly update shutdown marker
 	s.shutdownTracker.Start()
 
-	// Start the networking layer and the light server if requested
+	// Start the networking layer
 	s.handler.Start(s.p2pServer.MaxPeers)
 
 	// Start the connection manager
@@ -723,8 +781,9 @@ func (s *Ethereum) startCheckpointWhitelistService() {
 	s.retryHeimdallHandler(s.fetchAndHandleWhitelistCheckpoint, tickerDuration, whitelistTimeout)
 }
 
-// startMilestoneWhitelistService starts the goroutine to fetch milestiones and update the
-// milestone whitelist map.
+// startMilestoneWhitelistService starts the goroutine that updates the milestone whitelist map.
+// It subscribes to milestone events from heimdall via websocket when available, and falls back
+// to polling otherwise.
 func (s *Ethereum) startMilestoneWhitelistService() {
 	ethHandler, bor, _ := s.getHandler()
 
@@ -732,10 +791,17 @@ func (s *Ethereum) startMilestoneWhitelistService() {
 		tickerDuration = 2 * time.Second
 	)
 
-	// If heimdall ws is available use WS subscription to new milestone events instead of polling
+	// If heimdall WS is available, use WS subscription for new milestone events instead of polling
 	if bor != nil && bor.HeimdallWSClient != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-s.closeCh
+			cancel()
+		}()
+
 		for {
-			if err := s.subscribeAndHandleMilestone(context.Background(), ethHandler, bor); err != nil {
+			if err := s.subscribeAndHandleMilestone(ctx, ethHandler, bor); err != nil {
 				log.Error("Error subscribing to milestone events", "err", err)
 			}
 
@@ -744,7 +810,7 @@ func (s *Ethereum) startMilestoneWhitelistService() {
 			case <-s.closeCh:
 				return
 			case <-time.After(tickerDuration):
-				// Continue to retry subscribing to milestone event
+				// Continue to retry subscribing to milestone events
 			}
 		}
 	}
@@ -992,12 +1058,20 @@ func (s *Ethereum) Stop() error {
 	// Stop all the peer-related stuff first.
 	s.discmix.Close()
 
+	// Close the tx relay service if enabled
+	if s.APIBackend.relay != nil {
+		s.APIBackend.relay.Close()
+	}
+
 	// Close the engine before handler else it may cause a deadlock where
 	// the heimdall is unresponsive and the syncing loop keeps waiting
 	// for a response and is unable to proceed to exit `Finalize` during
 	// block processing.
 	s.engine.Close()
 	s.dropper.Stop()
+
+	// Stop the dial scheduler to suppress "Looking for peers" during shutdown.
+	s.p2pServer.StopDialing()
 	s.handler.Stop()
 
 	// Then stop everything else.
@@ -1013,6 +1087,7 @@ func (s *Ethereum) Stop() error {
 		s.miner.Close()
 	}
 	s.blockchain.Stop()
+	s.engine.Close()
 
 	// Clean shutdown marker as the last thing before closing db
 	s.shutdownTracker.Stop()

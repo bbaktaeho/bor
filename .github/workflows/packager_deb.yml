@@ -2,8 +2,6 @@ name: packager_deb
 
 on:
   push:
-    branches:
-      - 'master'
     paths:
       - '**'
     tags:
@@ -18,13 +16,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Set up Go
-        uses: actions/setup-go@master
+        uses: actions/setup-go@v6
         with:
-          go-version: 1.24.6
+          go-version-file: go.mod
       # Variables
       - name: Adding TAG to ENV
         run: echo "GIT_TAG=`echo $(git describe --tags --abbrev=0)`" >> $GITHUB_ENV
@@ -80,7 +78,7 @@ jobs:
         run: rm -rf packaging/deb/bor/DEBIAN/control
 
       - name: Building bor for arm64
-        run: GOARCH=arm64 GOOS=linux CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o build/bin/bor ./cmd/cli/main.go
+        run: GOARCH=arm64 GOOS=linux CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ CGO_ENABLED=1 go build -o build/bin/bor -pgo=prod.pprof ./cmd/cli/main.go
 
       - name: Copying necessary binary post arm64 build
         run: cp -rp build/bin/bor packaging/deb/bor/usr/bin/
@@ -118,6 +116,23 @@ jobs:
         env:
           ARCH: arm64
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.7.0
+
+      - name: Sign release artifacts with cosign
+        run: |
+          shopt -s nullglob
+          artifacts=(packaging/deb/bor-${{ env.GIT_TAG }}-*.deb)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No artifacts found to sign"
+            exit 1
+          fi
+          for artifact in "${artifacts[@]}"; do
+            cosign sign-blob --yes --oidc-provider=github-actions "$artifact" \
+              --output-signature "${artifact}.sig" \
+              --output-certificate "${artifact}.pem"
+          done
+
       - name: Release bor Packages
         uses: softprops/action-gh-release@v2
         with:
@@ -126,3 +141,28 @@ jobs:
           files: |
             packaging/deb/bor**.deb
             packaging/deb/bor**.deb.checksum
+            packaging/deb/bor**.deb.sig
+            packaging/deb/bor**.deb.pem
+
+      - name: Authenticate with GCP via OIDC
+        uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.5
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ secrets.GCP_OIDC_PROVIDER }}
+          service_account: ${{ secrets.GCP_OIDC_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_OIDC_PROJECT_ID }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Upload to GCP (shared buckets)
+        env:
+          BUCKET_PRIMARY: ${{ secrets.GCP_BUCKET_PRIMARY }}
+          BUCKET_SECONDARY: ${{ secrets.GCP_BUCKET_SECONDARY }}
+        run: |
+          for bucket in "$BUCKET_PRIMARY" "$BUCKET_SECONDARY"; do
+            gcloud storage cp packaging/deb/bor-**.deb "$bucket"
+            gcloud storage cp packaging/deb/bor-**.deb.checksum "$bucket"
+            gcloud storage cp packaging/deb/bor-**.deb.sig "$bucket"
+            gcloud storage cp packaging/deb/bor-**.deb.pem "$bucket"
+          done

@@ -47,18 +47,18 @@ func (m *MockGenesisContract) EXPECT() *MockGenesisContractMockRecorder {
 }
 
 // CommitState mocks base method.
-func (m *MockGenesisContract) CommitState(event *clerk.EventRecordWithTime, arg1 vm.StateDB, header *types.Header, chCtx statefull.ChainContext) (uint64, error) {
+func (m *MockGenesisContract) CommitState(event *clerk.EventRecordWithTime, arg1 vm.StateDB, header *types.Header, chCtx statefull.ChainContext, vmCfg vm.Config) (uint64, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CommitState", event, arg1, header, chCtx)
+	ret := m.ctrl.Call(m, "CommitState", event, arg1, header, chCtx, vmCfg)
 	ret0, _ := ret[0].(uint64)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // CommitState indicates an expected call of CommitState.
-func (mr *MockGenesisContractMockRecorder) CommitState(event, arg1, header, chCtx any) *gomock.Call {
+func (mr *MockGenesisContractMockRecorder) CommitState(event, arg1, header, chCtx, vmCfg any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CommitState", reflect.TypeOf((*MockGenesisContract)(nil).CommitState), event, arg1, header, chCtx)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CommitState", reflect.TypeOf((*MockGenesisContract)(nil).CommitState), event, arg1, header, chCtx, vmCfg)
 }
 
 // LastStateId mocks base method.

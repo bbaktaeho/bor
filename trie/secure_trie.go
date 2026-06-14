@@ -62,7 +62,7 @@ func NewSecure(stateRoot common.Hash, owner common.Hash, root common.Hash, db da
 // New and must have an attached database. The database also stores
 // the preimage of each key if preimage recording is enabled.
 //
-// StateTrie is not safe for concurrent use.
+// StateTrie is not safe for concurrent use unless EnableConcurrentReads is called.
 type StateTrie struct {
 	trie        Trie
 	db          database.NodeDatabase
@@ -97,6 +97,11 @@ func NewStateTrie(id *ID, db database.NodeDatabase) (*StateTrie, error) {
 	return tr, nil
 }
 
+// EnableConcurrentReads makes GetAccount, GetStorage etc. safe for concurrent use.
+func (t *StateTrie) EnableConcurrentReads() {
+	t.trie.EnableConcurrentReads()
+}
+
 // MustGet returns the value for key stored in the trie.
 // The value bytes must not be modified by the caller.
 //
@@ -104,19 +109,6 @@ func NewStateTrie(id *ID, db database.NodeDatabase) (*StateTrie, error) {
 // print out an error message.
 func (t *StateTrie) MustGet(key []byte) []byte {
 	return t.trie.MustGet(crypto.Keccak256(key))
-}
-
-// GetStorage attempts to retrieve a storage slot with provided account address
-// and slot key. The value bytes must not be modified by the caller.
-// If the specified storage slot is not in the trie, nil will be returned.
-// If a trie node is not found in the database, a MissingNodeError is returned.
-func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
-	enc, err := t.trie.Get(crypto.Keccak256(key))
-	if err != nil || len(enc) == 0 {
-		return nil, err
-	}
-	_, content, _, err := rlp.Split(enc)
-	return content, err
 }
 
 // GetAccount attempts to retrieve an account with provided account address.
@@ -143,6 +135,39 @@ func (t *StateTrie) GetAccountByHash(addrHash common.Hash) (*types.StateAccount,
 	ret := new(types.StateAccount)
 	err = rlp.DecodeBytes(res, ret)
 	return ret, err
+}
+
+// PrefetchAccount attempts to resolve specific accounts from the database
+// to accelerate subsequent trie operations.
+func (t *StateTrie) PrefetchAccount(addresses []common.Address) error {
+	var keys [][]byte
+	for _, addr := range addresses {
+		keys = append(keys, crypto.Keccak256(addr.Bytes()))
+	}
+	return t.trie.Prefetch(keys)
+}
+
+// GetStorage attempts to retrieve a storage slot with provided account address
+// and slot key. The value bytes must not be modified by the caller.
+// If the specified storage slot is not in the trie, nil will be returned.
+// If a trie node is not found in the database, a MissingNodeError is returned.
+func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
+	enc, err := t.trie.Get(crypto.Keccak256(key))
+	if err != nil || len(enc) == 0 {
+		return nil, err
+	}
+	_, content, _, err := rlp.Split(enc)
+	return content, err
+}
+
+// PrefetchStorage attempts to resolve specific storage slots from the database
+// to accelerate subsequent trie operations.
+func (t *StateTrie) PrefetchStorage(_ common.Address, keys [][]byte) error {
+	var keylist [][]byte
+	for _, key := range keys {
+		keylist = append(keylist, crypto.Keccak256(key))
+	}
+	return t.trie.Prefetch(keylist)
 }
 
 // GetNode attempts to retrieve a trie node by compact-encoded path. It is not
@@ -254,7 +279,7 @@ func (t *StateTrie) GetKey(shaKey []byte) []byte {
 }
 
 // Witness returns a set containing all trie nodes that have been accessed.
-func (t *StateTrie) Witness() map[string]struct{} {
+func (t *StateTrie) Witness() map[string][]byte {
 	return t.trie.Witness()
 }
 

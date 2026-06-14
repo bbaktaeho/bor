@@ -54,6 +54,10 @@ var (
 	// ErrRequestsHashMismatch indicates a mismatch between locally computed
 	// requests hash and the block's requests hash during validation.
 	ErrRequestsHashMismatch = errors.New("invalid requests hash")
+
+	// ErrBlockOversized is returned if the size of the RLP-encoded block
+	// exceeds the cap established by EIP 7934
+	ErrBlockOversized = errors.New("block RLP-encoded size exceeds maximum")
 )
 
 // List of evm-call-message pre-checking errors. All state transition messages will
@@ -140,6 +144,9 @@ var (
 	// ErrMissingBlobHashes is returned if a blob transaction has no blob hashes.
 	ErrMissingBlobHashes = errors.New("blob transaction missing blob hashes")
 
+	// ErrTooManyBlobs is returned if a blob transaction exceeds the maximum number of blobs.
+	ErrTooManyBlobs = errors.New("blob transaction has too many blobs")
+
 	// ErrBlobTxCreate is returned if a blob transaction has no explicit to field.
 	ErrBlobTxCreate = errors.New("blob transaction of type create")
 
@@ -161,4 +168,24 @@ var (
 	ErrAuthorizationInvalidSignature   = errors.New("EIP-7702 authorization has invalid signature")
 	ErrAuthorizationDestinationHasCode = errors.New("EIP-7702 authorization destination is a contract")
 	ErrAuthorizationNonceMismatch      = errors.New("EIP-7702 authorization nonce does not match current account nonce")
+)
+
+// Bor related errors
+var (
+	// ErrStateSyncProcessing is returned when the node fails to fetch or apply
+	// state-sync events from Heimdall during block finalization. This is an
+	// operational error — Heimdall may be temporarily unavailable or returning
+	// errors, and the operation may succeed on retry.
+	ErrStateSyncProcessing = errors.New("unable to process state-sync")
+
+	// ErrStateSyncMismatch is returned when the locally computed state-sync result
+	// does not match the block body or receipts. This includes:
+	// - missing state-sync transaction in block body (post-Madhugiri)
+	// - state-sync transaction hash mismatch between block body and locally constructed one
+	// - receipt count mismatch after state-sync receipt insertion
+	//
+	// Unlike ErrStateSyncProcessing, this indicates a disagreement between the block
+	// producer and the local node's view of Heimdall state — the block was produced
+	// with different state-sync data than what this node computed.
+	ErrStateSyncMismatch = errors.New("state-sync mismatch")
 )

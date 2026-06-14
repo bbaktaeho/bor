@@ -7,6 +7,8 @@ import (
 
 	borTypes "github.com/0xPolygon/heimdall-v2/x/bor/types"
 	ctypes "github.com/cometbft/cometbft/rpc/core/types"
+	"go.uber.org/mock/gomock"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/bor"
@@ -20,13 +22,13 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/tests/bor/mocks"
 	"github.com/ethereum/go-ethereum/triedb"
-	gomock "go.uber.org/mock/gomock"
 )
 
 type DefaultBorMiner struct {
@@ -148,6 +150,12 @@ func NewDBForFakes(t TensingObject) (ethdb.Database, *core.Genesis, *params.Chai
 		t.Fatalf("can't create new chain config: %v", err)
 	}
 
+	// Make a copy of BorConfig to avoid race conditions with parallel tests
+	if chainConfig.Bor != nil {
+		borCopy := *chainConfig.Bor
+		chainConfig.Bor = &borCopy
+	}
+
 	chainConfig.Bor.Period = map[string]uint64{
 		"0": 1,
 	}
@@ -165,7 +173,7 @@ func NewFakeBor(t TensingObject, chainDB ethdb.Database, chainConfig *params.Cha
 		chainConfig.Bor = params.BorUnittestChainConfig.Bor
 	}
 
-	return bor.New(chainConfig, chainDB, ethAPIMock, spanner, heimdallClientMock, heimdallClientWSMock, contractMock, false, 0)
+	return bor.New(chainConfig, chainDB, ethAPIMock, spanner, heimdallClientMock, heimdallClientWSMock, contractMock, false, 0, vm.Config{})
 }
 
 func createMockSpanForTest(address common.Address, chainId string) borTypes.Span {
@@ -214,9 +222,10 @@ func (m *mockBackendBor) BlockChain() *core.BlockChain {
 	return m.bc
 }
 
-// PeerCount implements Backend.
+// PeerCount implements Backend. Returns a constant; tests using
+// mockBackendBor don't drive the peer count.
 func (*mockBackendBor) PeerCount() int {
-	panic("unimplemented")
+	return 1
 }
 
 func (m *mockBackendBor) TxPool() *txpool.TxPool {

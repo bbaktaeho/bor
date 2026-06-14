@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/blockstm"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -70,7 +71,7 @@ func TestUpdateLeaks(t *testing.T) {
 		}
 
 		if i%3 == 0 {
-			state.SetCode(addr, []byte{i, i, i, i, i})
+			state.SetCode(addr, []byte{i, i, i, i, i}, tracing.CodeChangeUnspecified)
 		}
 	}
 
@@ -107,7 +108,7 @@ func TestIntermediateLeaks(t *testing.T) {
 		}
 
 		if i%3 == 0 {
-			state.SetCode(addr, []byte{i, i, i, i, i, tweak})
+			state.SetCode(addr, []byte{i, i, i, i, i, tweak}, tracing.CodeChangeUnspecified)
 		}
 	}
 
@@ -389,7 +390,7 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 				code := make([]byte, 16)
 				binary.BigEndian.PutUint64(code, uint64(a.args[0]))
 				binary.BigEndian.PutUint64(code[8:], uint64(a.args[1]))
-				s.SetCode(addr, code)
+				s.SetCode(addr, code, tracing.CodeChangeUnspecified)
 			},
 			args: make([]int64, 2),
 		},
@@ -418,7 +419,7 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 					// which would cause a difference in state when unrolling
 					// the journal. (CreateContact assumes created was false prior to
 					// invocation, and the journal rollback sets it to false).
-					s.SetCode(addr, []byte{1})
+					s.SetCode(addr, []byte{1}, tracing.CodeChangeUnspecified)
 				}
 			},
 		},
@@ -674,7 +675,7 @@ func (test *snapshotTest) checkEqual(state, checkstate *StateDB) error {
 		{
 			have := state.transientStorage
 			want := checkstate.transientStorage
-			if !maps.EqualFunc(have, want, maps.Equal) {
+			if !have.EqualTS(want) {
 				return fmt.Errorf("transient storage differs ,have\n%v\nwant\n%v",
 					have.PrettyPrint(),
 					want.PrettyPrint())
@@ -803,6 +804,42 @@ func TestMVHashMapReadWriteDelete(t *testing.T) {
 
 	assert.Equal(t, common.Hash{}, v)
 	assert.Equal(t, uint256.NewInt(0), b)
+}
+
+func TestDumpMapsUseCorrectReadWriteSets(t *testing.T) {
+	t.Parallel()
+
+	db := NewDatabaseForTesting()
+	mvhm := blockstm.MakeMVHashMap()
+	s, _ := NewWithMVHashmap(common.Hash{}, db, nil, mvhm)
+
+	addr := common.HexToAddress("0x01")
+	readKey := common.HexToHash("0x01")
+	writeKey := common.HexToHash("0x02")
+
+	s.GetOrNewStateObject(addr)
+	s.ClearReadMap()
+	s.ClearWriteMap()
+	s.txIndex = 3
+
+	assert.Equal(t, common.Hash{}, s.GetState(addr, readKey))
+	s.SetState(addr, writeKey, common.HexToHash("0xff"))
+
+	readDump := s.GetReadMapDump()
+	writeDump := s.GetWriteMapDump()
+
+	readPath := blockstm.NewStateKey(addr, readKey)
+	writePath := blockstm.NewStateKey(addr, writeKey)
+
+	assert.True(t, slices.ContainsFunc(readDump, func(d DumpStruct) bool {
+		return d.Op == "Read\n" && bytes.Equal(d.Path, readPath[:])
+	}))
+	assert.True(t, slices.ContainsFunc(writeDump, func(d DumpStruct) bool {
+		return d.Op == "Write\n" && bytes.Equal(d.Path, writePath[:])
+	}))
+	assert.False(t, slices.ContainsFunc(writeDump, func(d DumpStruct) bool {
+		return bytes.Equal(d.Path, readPath[:])
+	}))
 }
 
 func TestMVHashMapCreateContract(t *testing.T) {
@@ -1003,9 +1040,9 @@ func TestMVHashMapOverwrite(t *testing.T) {
 	// Tx1 delete
 	for _, v := range states[1].writeMap {
 		mvhm.Delete(v.Path, 1)
-
-		states[1].writeMap = nil
 	}
+
+	states[1].writeMap = nil
 
 	// Tx3 read should get Tx0's value
 	v = states[3].GetState(addr, key)
@@ -1024,9 +1061,9 @@ func TestMVHashMapOverwrite(t *testing.T) {
 	// Tx0 delete
 	for _, v := range states[0].writeMap {
 		mvhm.Delete(v.Path, 0)
-
-		states[0].writeMap = nil
 	}
+
+	states[0].writeMap = nil
 
 	// Tx4 read again should get default vals
 	v = states[4].GetState(addr, key)
@@ -1093,9 +1130,9 @@ func TestMVHashMapWriteNoConflict(t *testing.T) {
 	// Tx2 delete
 	for _, v := range states[2].writeMap {
 		mvhm.Delete(v.Path, 2)
-
-		states[2].writeMap = nil
 	}
+
+	states[2].writeMap = nil
 
 	assert.Equal(t, val1, states[4].GetState(addr, key1))
 	assert.Equal(t, balance1, states[4].GetBalance(addr))
@@ -1112,9 +1149,9 @@ func TestMVHashMapWriteNoConflict(t *testing.T) {
 	// Tx1 delete
 	for _, v := range states[1].writeMap {
 		mvhm.Delete(v.Path, 1)
-
-		states[1].writeMap = nil
 	}
+
+	states[1].writeMap = nil
 
 	assert.Equal(t, common.Hash{}, states[6].GetState(addr, key1))
 	assert.Equal(t, common.Hash{}, states[6].GetState(addr, key2))
@@ -1204,12 +1241,12 @@ func TestApplyMVWriteSet(t *testing.T) {
 
 	// Tx3 write
 	states[3].SelfDestruct(addr2)
-	states[3].SetCode(addr1, code)
+	states[3].SetCode(addr1, code, tracing.CodeChangeUnspecified)
 	states[3].Finalise(true)
 	states[3].FlushMVWriteSet()
 
 	sSingleProcess.SelfDestruct(addr2)
-	sSingleProcess.SetCode(addr1, code)
+	sSingleProcess.SetCode(addr1, code, tracing.CodeChangeUnspecified)
 
 	sClean.ApplyMVWriteSet(states[3].MVWriteList())
 
@@ -1302,7 +1339,7 @@ func TestCopyCommitCopy(t *testing.T) {
 	sval := common.HexToHash("bbb")
 
 	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
-	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetCode(addr, []byte("hello"), tracing.CodeChangeUnspecified)          // Change an external metadata
 	state.SetState(addr, skey, sval)                                             // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
@@ -1351,7 +1388,7 @@ func TestCopyCommitCopy(t *testing.T) {
 		t.Fatalf("second copy non-committed storage slot mismatch: have %x, want %x", val, sval)
 	}
 	if val := copyTwo.GetCommittedState(addr, skey); val != (common.Hash{}) {
-		t.Fatalf("second copy committed storage slot mismatch: have %x, want %x", val, sval)
+		t.Fatalf("second copy committed storage slot mismatch: have %x, want %x", val, common.Hash{})
 	}
 	// Commit state, ensure states can be loaded from disk
 	root, _ := state.Commit(0, false, false)
@@ -1383,7 +1420,7 @@ func TestCopyCopyCommitCopy(t *testing.T) {
 	sval := common.HexToHash("bbb")
 
 	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
-	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetCode(addr, []byte("hello"), tracing.CodeChangeUnspecified)          // Change an external metadata
 	state.SetState(addr, skey, sval)                                             // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
@@ -1449,7 +1486,7 @@ func TestCopyCopyCommitCopy(t *testing.T) {
 		t.Fatalf("third copy non-committed storage slot mismatch: have %x, want %x", val, sval)
 	}
 	if val := copyThree.GetCommittedState(addr, skey); val != (common.Hash{}) {
-		t.Fatalf("third copy committed storage slot mismatch: have %x, want %x", val, sval)
+		t.Fatalf("third copy committed storage slot mismatch: have %x, want %x", val, common.Hash{})
 	}
 }
 
@@ -1464,7 +1501,7 @@ func TestCommitCopy(t *testing.T) {
 	sval1, sval2 := common.HexToHash("b1"), common.HexToHash("b2")
 
 	state.SetBalance(addr, uint256.NewInt(42), tracing.BalanceChangeUnspecified) // Change the account trie
-	state.SetCode(addr, []byte("hello"))                                         // Change an external metadata
+	state.SetCode(addr, []byte("hello"), tracing.CodeChangeUnspecified)          // Change an external metadata
 	state.SetState(addr, skey1, sval1)                                           // Change the storage trie
 
 	if balance := state.GetBalance(addr); balance.Cmp(uint256.NewInt(42)) != 0 {
@@ -1502,10 +1539,10 @@ func TestCommitCopy(t *testing.T) {
 	}
 	// Slots cached in the stateDB, available after commit
 	if val := copied.GetState(addr, skey2); val != sval2 {
-		t.Fatalf("unexpected storage slot: have %x", sval1)
+		t.Fatalf("unexpected storage slot: have %x, want %x", val, sval2)
 	}
 	if val := copied.GetCommittedState(addr, skey2); val != sval2 {
-		t.Fatalf("unexpected storage slot: have %x", val)
+		t.Fatalf("unexpected storage slot: have %x, want %x", val, sval2)
 	}
 }
 
@@ -1577,11 +1614,11 @@ func testMissingTrieNodes(t *testing.T, scheme string) {
 	addr := common.BytesToAddress([]byte("so"))
 	{
 		state.SetBalance(addr, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
-		state.SetCode(addr, []byte{1, 2, 3})
+		state.SetCode(addr, []byte{1, 2, 3}, tracing.CodeChangeUnspecified)
 
 		a2 := common.BytesToAddress([]byte("another"))
 		state.SetBalance(a2, uint256.NewInt(100), tracing.BalanceChangeUnspecified)
-		state.SetCode(a2, []byte{1, 2, 4})
+		state.SetCode(a2, []byte{1, 2, 4}, tracing.CodeChangeUnspecified)
 		root, _ = state.Commit(0, false, false)
 		t.Logf("root: %x", root)
 		// force-flush
@@ -2010,7 +2047,7 @@ func TestShouldDeleteSmartContractIfItExistsInState(t *testing.T) {
 	addr := common.HexToAddress("0x01")
 	s.getOrNewStateObject(addr)
 	s.CreateContract(addr)
-	s.SetCode(addr, code)
+	s.SetCode(addr, code, tracing.CodeChangeUnspecified)
 	s.Finalise(true)
 
 	secondDB := s.Copy()
@@ -2024,4 +2061,340 @@ func TestShouldDeleteSmartContractIfItExistsInState(t *testing.T) {
 
 	codeAfterDeletion := s.GetCode(addr)
 	assert.Equal(t, []byte(nil), codeAfterDeletion, "smart contract should be deleted")
+}
+
+// EqualTS is a transientStorage's helper method for comparing transient storage maps.
+func (t transientStorage) EqualTS(other transientStorage) bool {
+	// Compare the maps
+	if len(t) != len(other) {
+		return false
+	}
+	for k, v := range t {
+		ov, ok := other[k]
+		if !ok || !maps.Equal(v, ov) {
+			return false
+		}
+	}
+	return true
+}
+
+// containsKey returns true if the provided write descriptor list contains the given key.
+func containsKey(writes []blockstm.WriteDescriptor, key blockstm.Key) bool {
+	for _, w := range writes {
+		if w.Path == key {
+			return true
+		}
+	}
+	return false
+}
+
+// Test that selfdestruct writes (suicide and balance) are excluded after revert.
+func TestRevertWriteSelfDestruct(t *testing.T) {
+	t.Parallel()
+
+	db := NewDatabase(triedb.NewDatabase(rawdb.NewMemoryDatabase(), triedb.HashDefaults), nil)
+	mvhm := blockstm.MakeMVHashMap()
+	s, _ := NewWithMVHashmap(common.Hash{}, db, nil, mvhm)
+
+	addr := common.HexToAddress("0x06")
+	s.CreateAccount(addr)
+	s.SetBalance(addr, uint256.NewInt(100), tracing.BalanceChangeTransfer)
+	// Clear writes so only selfdestruct writes are tracked
+	s.ClearWriteMap()
+
+	snap := s.Snapshot()
+	s.SelfDestruct(addr)
+
+	keySuicide := blockstm.NewSubpathKey(addr, SuicidePath)
+	assert.True(t, containsKey(s.MVFullWriteList(), keySuicide))
+	assert.True(t, containsKey(s.MVWriteList(), keySuicide))
+
+	s.RevertToSnapshot(snap)
+	// Full list still contains both, filtered excludes both
+	assert.True(t, containsKey(s.MVFullWriteList(), keySuicide))
+	assert.False(t, containsKey(s.MVWriteList(), keySuicide))
+}
+
+// TestWitnessCollectionTiming verifies that IntermediateRoot populates
+// the WitnessCollection duration field when a witness is attached.
+func TestWitnessCollectionTiming(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(db, nil)
+	sdb := NewDatabase(tdb, nil)
+
+	// Test with witness: WitnessCollection should be populated
+	state, _ := New(types.EmptyRootHash, sdb)
+
+	witness := &stateless.Witness{
+		Headers: []*types.Header{},
+		Codes:   make(map[string]struct{}),
+		State:   make(map[string]struct{}),
+	}
+	state.SetWitness(witness)
+
+	for i := byte(0); i < 20; i++ {
+		addr := common.BytesToAddress([]byte{i})
+		state.AddBalance(addr, uint256.NewInt(uint64(100*i+1)), tracing.BalanceChangeUnspecified)
+		state.SetState(addr, common.BytesToHash([]byte{i}), common.BytesToHash([]byte{i, i}))
+	}
+
+	state.IntermediateRoot(true)
+
+	if state.WitnessCollection == 0 {
+		t.Error("WitnessCollection should be > 0 when witness is attached")
+	}
+
+	// Test without witness: WitnessCollection should remain zero
+	state2, _ := New(types.EmptyRootHash, sdb)
+
+	for i := byte(0); i < 20; i++ {
+		addr := common.BytesToAddress([]byte{i})
+		state2.AddBalance(addr, uint256.NewInt(uint64(100*i+1)), tracing.BalanceChangeUnspecified)
+		state2.SetState(addr, common.BytesToHash([]byte{i}), common.BytesToHash([]byte{i, i}))
+	}
+
+	state2.IntermediateRoot(true)
+
+	if state2.WitnessCollection != 0 {
+		t.Errorf("WitnessCollection should be 0 without witness, got %v", state2.WitnessCollection)
+	}
+}
+
+// BenchmarkMVReadOverhead simulates the BlockSTM hot path: multiple worker copies
+// of a StateDB reading state through MVRead with an active MVHashMap. This exercises
+// the full path including writeMap checks, nested getStateObject guards,
+// MVHashMap.Read (Floor queries), and key construction.
+func BenchmarkMVReadOverhead(b *testing.B) {
+	// Setup: create base state with accounts and storage
+	db := NewDatabase(triedb.NewDatabase(rawdb.NewMemoryDatabase(), triedb.HashDefaults), nil)
+	mvhm := blockstm.MakeMVHashMap()
+	base, _ := NewWithMVHashmap(common.Hash{}, db, nil, mvhm)
+
+	const numAccounts = 50
+	const numSlotsPerAccount = 20
+	const numTxs = 200
+
+	addrs := make([]common.Address, numAccounts)
+	slots := make([]common.Hash, numSlotsPerAccount)
+
+	for i := range addrs {
+		// Use keccak-derived addresses for realistic byte distribution (uniform
+		// entropy in all positions), matching real Ethereum addresses.
+		addrs[i] = common.BytesToAddress(crypto.Keccak256(big.NewInt(int64(i + 1)).Bytes()))
+		slots[i%numSlotsPerAccount] = common.BytesToHash(crypto.Keccak256(big.NewInt(int64(i + 1000)).Bytes()))
+	}
+
+	for i := range slots {
+		slots[i] = common.BytesToHash(crypto.Keccak256(big.NewInt(int64(i + 1000)).Bytes()))
+	}
+
+	// Populate base state: create accounts with balance and storage
+	for _, addr := range addrs {
+		base.getOrNewStateObject(addr)
+		base.SetBalance(addr, uint256.NewInt(1000), tracing.BalanceChangeUnspecified)
+
+		for _, slot := range slots {
+			base.SetState(addr, slot, common.BigToHash(big.NewInt(42)))
+		}
+	}
+
+	base.Finalise(true)
+	base.FlushMVWriteSet()
+
+	// Simulate some earlier txs having written to the MVHashMap (realistic scenario)
+	for txIdx := 0; txIdx < numTxs/2; txIdx++ {
+		writer := base.Copy()
+		writer.txIndex = txIdx
+
+		addr := addrs[txIdx%numAccounts]
+		slot := slots[txIdx%numSlotsPerAccount]
+		writer.SetState(addr, slot, common.BigToHash(big.NewInt(int64(txIdx+100))))
+		writer.SetBalance(addr, uint256.NewInt(uint64(txIdx+2000)), tracing.BalanceChangeUnspecified)
+		writer.Finalise(true)
+		writer.FlushMVWriteSet()
+	}
+
+	// Sub-benchmarks for different access patterns
+	b.Run("GetState", func(b *testing.B) {
+		// Simulate a worker tx reading storage (the most common MVRead path)
+		worker := base.Copy()
+		worker.txIndex = numTxs - 1
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			addr := addrs[i%numAccounts]
+			slot := slots[i%numSlotsPerAccount]
+			worker.GetState(addr, slot)
+		}
+	})
+
+	b.Run("GetBalance", func(b *testing.B) {
+		worker := base.Copy()
+		worker.txIndex = numTxs - 1
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			addr := addrs[i%numAccounts]
+			worker.GetBalance(addr)
+		}
+	})
+
+	b.Run("GetState_WithLocalWrites", func(b *testing.B) {
+		// Worker that has written some keys (exercises writeMap/writeAddrs check)
+		worker := base.Copy()
+		worker.txIndex = numTxs - 1
+
+		// Write to a few addresses so writeMap is non-empty
+		for j := 0; j < 10; j++ {
+			worker.SetState(addrs[j], slots[0], common.BigToHash(big.NewInt(999)))
+		}
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			addr := addrs[i%numAccounts]
+			slot := slots[i%numSlotsPerAccount]
+			worker.GetState(addr, slot)
+		}
+	})
+
+	b.Run("GetState_MultiWorker", func(b *testing.B) {
+		// Simulates multiple workers reading the same storage slots from a clean
+		// statedb (no pre-populated stateObjects), matching production where
+		// cleanStateDB is created from the trie root with empty stateObjects.
+		root, _ := base.Commit(0, true, false)
+
+		cleanDB, _ := New(root, db)
+		cleanDB.SetMVHashmap(mvhm)
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			worker := cleanDB.Copy()
+			worker.txIndex = numTxs - 1
+			worker.SetMVHashmap(mvhm)
+
+			for j := 0; j < 5; j++ {
+				addr := addrs[j]
+				for k := 0; k < numSlotsPerAccount; k++ {
+					worker.GetState(addr, slots[k])
+				}
+			}
+		}
+	})
+
+	b.Run("GetState_8Workers", func(b *testing.B) {
+		// 8 concurrent workers sharing the same MVHashMap, each reading
+		// 5 addresses × 20 slots = 100 state reads per iteration.
+		root, _ := base.Commit(0, true, false)
+
+		cleanDB, _ := New(root, db)
+		cleanDB.SetMVHashmap(mvhm)
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			var wg sync.WaitGroup
+			wg.Add(8)
+
+			for w := 0; w < 8; w++ {
+				go func(workerID int) {
+					defer wg.Done()
+					worker := cleanDB.Copy()
+					worker.txIndex = numTxs - 1 - workerID
+					worker.SetMVHashmap(mvhm)
+
+					for j := 0; j < 5; j++ {
+						addr := addrs[(workerID+j)%numAccounts]
+						for k := 0; k < numSlotsPerAccount; k++ {
+							worker.GetState(addr, slots[k])
+						}
+					}
+				}(w)
+			}
+
+			wg.Wait()
+		}
+	})
+
+	b.Run("GetState_RepeatedRead", func(b *testing.B) {
+		// Simulates the common pattern where GetState and GetCommittedState
+		// read the same key consecutively (e.g., in EVM SLOAD which calls
+		// getState→GetCommittedState, both triggering MVRead for the same key).
+		worker := base.Copy()
+		worker.txIndex = numTxs - 1
+
+		addr := addrs[0]
+		slot := slots[0]
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			worker.GetState(addr, slot)
+			worker.GetCommittedState(addr, slot)
+		}
+	})
+
+	b.Run("Settlement_ApplyMVWriteSet", func(b *testing.B) {
+		// Simulate settlement: ApplyMVWriteSet on a statedb without MVHashMap
+		// Use realistic write counts: ~5 accounts, ~10 storage slots each = ~50 writes
+		writer := base.Copy()
+		writer.txIndex = numTxs/2 + 1
+
+		for j := 0; j < numAccounts && j < 5; j++ {
+			writer.SetBalance(addrs[j], uint256.NewInt(uint64(j+3000)), tracing.BalanceChangeUnspecified)
+			writer.SetNonce(addrs[j], uint64(j+100), tracing.NonceChangeUnspecified)
+			for k := 0; k < numSlotsPerAccount && k < 10; k++ {
+				writer.SetState(addrs[j], slots[k], common.BigToHash(big.NewInt(int64(j*100+k+500))))
+			}
+		}
+
+		writer.Finalise(true)
+		writes := writer.MVWriteList()
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			target := base.Copy()
+			target.mvHashmap = nil // settlement mode: no MVHashMap
+			target.ApplyMVWriteSet(writes)
+			target.Finalise(true)
+		}
+	})
+
+	b.Run("Copy_Empty", func(b *testing.B) {
+		// Copy of a clean statedb with no stateObjects (first tx scenario)
+		root, _ := base.Commit(0, true, false)
+		cleanDB, _ := New(root, db)
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			_ = cleanDB.Copy()
+		}
+	})
+
+	b.Run("Copy_WithObjects", func(b *testing.B) {
+		// Copy of a statedb that has accumulated some stateObjects (mid-block scenario)
+		root, _ := base.Commit(0, true, false)
+		cleanDB, _ := New(root, db)
+
+		// Touch some accounts to populate stateObjects
+		for j := 0; j < 10; j++ {
+			cleanDB.GetBalance(addrs[j])
+			for k := 0; k < 5; k++ {
+				cleanDB.GetState(addrs[j], slots[k])
+			}
+		}
+
+		b.ReportMetric(float64(len(cleanDB.stateObjects)), "stateObjects")
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			_ = cleanDB.Copy()
+		}
+	})
 }

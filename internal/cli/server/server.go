@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,21 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/hellofresh/health-go/v5"
+	"github.com/mattn/go-colorable"
+	"github.com/mattn/go-isatty"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
@@ -33,24 +49,18 @@ import (
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
-	"github.com/hellofresh/health-go/v5"
-	"github.com/mattn/go-colorable"
-	"github.com/mattn/go-isatty"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
 
 	// Force-load the tracer engines to trigger registration
 	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
+	_ "github.com/ethereum/go-ethereum/eth/tracers/live"
 	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
 
 	protobor "github.com/0xPolygon/polyproto/bor"
 )
+
+// maxGRPCMessageSize matches go-ethereum's BatchResponseMaxSize default
+// to keep the gRPC and JSON-RPC surfaces under comparable response-size protection.
+const maxGRPCMessageSize = 25 * 1000 * 1000
 
 type Server struct {
 	proto.UnimplementedBorServer
@@ -71,8 +81,6 @@ type Server struct {
 
 type serverOption func(srv *Server, config *Config) error
 
-var glogger *log.GlogHandler
-
 func init() {
 	handler := log.NewTerminalHandlerWithLevel(os.Stderr, log.LevelInfo, false)
 	log.SetDefault(log.NewLogger(handler))
@@ -80,40 +88,53 @@ func init() {
 
 func WithGRPCAddress() serverOption {
 	return func(srv *Server, config *Config) error {
-		return srv.gRPCServerByAddress(config.GRPC.Addr)
+		// readConfigFile may leave config.GRPC nil when the HCL/TOML config
+		// omits the [grpc] block. Treat that as "gRPC disabled" instead of
+		// dereferencing into a panic at startup.
+		if config.GRPC == nil {
+			log.Info("gRPC server disabled (no [grpc] block in config)")
+			return nil
+		}
+		addr := config.GRPC.Addr
+		if addr == "" {
+			log.Info("gRPC server disabled (grpc.addr is empty)")
+			return nil
+		}
+		// Mirror heimdall's client-side posture: warn (don't block) when the
+		// operator opts into a non-loopback bind without a bearer token. The
+		// startup log entry is what operators are expected to act on.
+		if config.GRPC.Token == "" && !IsLoopbackHostPort(addr) {
+			log.Warn(
+				"Starting unauthenticated gRPC server on non-loopback address; "+
+					"set --grpc.token / BOR_GRPC_TOKEN to require authentication.",
+				"addr", addr,
+			)
+		}
+		return srv.gRPCServerByAddress(addr)
 	}
+}
+
+// IsLoopbackHostPort reports whether hostport refers to a loopback host. It
+// returns false for wildcard binds (":3131", "0.0.0.0:3131", "[::]:3131").
+func IsLoopbackHostPort(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func WithGRPCListener(lis net.Listener) serverOption {
 	return func(srv *Server, _ *Config) error {
 		return srv.gRPCServerByListener(lis)
 	}
-}
-
-func VerbosityIntToString(verbosity int) string {
-	mapIntToString := map[int]string{
-		5: "trace",
-		4: "debug",
-		3: "info",
-		2: "warn",
-		1: "error",
-		0: "crit",
-	}
-
-	return mapIntToString[verbosity]
-}
-
-func VerbosityStringToInt(loglevel string) int {
-	mapStringToInt := map[string]int{
-		"trace": 5,
-		"debug": 4,
-		"info":  3,
-		"warn":  2,
-		"error": 1,
-		"crit":  0,
-	}
-
-	return mapStringToInt[loglevel]
 }
 
 //nolint:gocognit
@@ -460,7 +481,12 @@ func (s *Server) gRPCServerByAddress(addr string) error {
 }
 
 func (s *Server) gRPCServerByListener(listener net.Listener) error {
-	s.grpcServer = grpc.NewServer(s.withLoggingUnaryInterceptor())
+	s.grpcServer = grpc.NewServer(
+		grpc.UnaryInterceptor(s.combinedUnaryInterceptor()),
+		grpc.StreamInterceptor(s.combinedStreamInterceptor()),
+		grpc.MaxRecvMsgSize(maxGRPCMessageSize),
+		grpc.MaxSendMsgSize(maxGRPCMessageSize),
+	)
 	proto.RegisterBorServer(s.grpcServer, s)
 	protobor.RegisterBorApiServer(s.grpcServer, s)
 	reflection.Register(s.grpcServer)
@@ -476,44 +502,111 @@ func (s *Server) gRPCServerByListener(listener net.Listener) error {
 	return nil
 }
 
-func (s *Server) withLoggingUnaryInterceptor() grpc.ServerOption {
-	return grpc.UnaryInterceptor(s.loggingServerInterceptor)
+// combinedUnaryInterceptor returns a single unary server interceptor that
+// optionally enforces bearer-token authentication (when a token is configured)
+// and logs the request outcome — both successful handler invocations and
+// auth-rejected attempts. Rejected attempts are logged, successful calls are
+// logged at Trace, rejections at Debug.
+func (s *Server) combinedUnaryInterceptor() grpc.UnaryServerInterceptor {
+	token := s.tokenForInterceptor()
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if token != "" {
+			if err := authenticate(ctx, token); err != nil {
+				log.Debug("gRPC auth rejected", "method", info.FullMethod, "error", err)
+				return nil, err
+			}
+		}
+		start := time.Now()
+		h, err := handler(ctx, req)
+		log.Trace("Request", "method", info.FullMethod, "duration", time.Since(start), "error", err)
+		return h, err
+	}
 }
 
-func (s *Server) loggingServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	start := time.Now()
-	h, err := handler(ctx, req)
+// combinedStreamInterceptor mirrors combinedUnaryInterceptor for stream RPCs.
+// Needed so the reflection service is gated by the same bearer-token check as
+// unary calls. Logging behavior matches combinedUnaryInterceptor: rejected
+// auth at Debug, successful stream duration at Trace.
+func (s *Server) combinedStreamInterceptor() grpc.StreamServerInterceptor {
+	token := s.tokenForInterceptor()
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if token != "" {
+			if err := authenticate(ss.Context(), token); err != nil {
+				log.Debug("gRPC auth rejected (stream)", "method", info.FullMethod, "error", err)
+				return err
+			}
+		}
+		start := time.Now()
+		err := handler(srv, ss)
+		log.Trace("Stream", "method", info.FullMethod, "duration", time.Since(start), "error", err)
+		return err
+	}
+}
 
-	log.Trace("Request", "method", info.FullMethod, "duration", time.Since(start), "error", err)
+// tokenForInterceptor returns the configured bearer token, or empty when no
+// [grpc] block exists in the config. Empty disables auth — callers like
+// gRPCServerByListener may run with a partial Config (e.g., tests, embedders),
+// so reading s.config.GRPC.Token directly would nil-deref. Mirrors the same
+// "missing block = disabled" treatment WithGRPCAddress applies.
+func (s *Server) tokenForInterceptor() string {
+	if s.config == nil || s.config.GRPC == nil {
+		return ""
+	}
+	return s.config.GRPC.Token
+}
 
-	return h, err
+// authenticate validates the bearer token in the gRPC metadata against the
+// configured token.
+// Token byte-comparison uses subtle.ConstantTimeCompare, which is constant-time
+// for equal-length inputs; length-mismatched inputs short-circuit.
+// Scheme matching is case-insensitive per RFC 6750 §2.1.
+func authenticate(ctx context.Context, expected string) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	headers := md.Get("authorization")
+	if len(headers) == 0 {
+		return status.Error(codes.Unauthenticated, "missing authorization header")
+	}
+	const prefix = "Bearer "
+	h := headers[0]
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return status.Error(codes.Unauthenticated, "invalid authorization header")
+	}
+	got := h[len(prefix):]
+	if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+		return status.Error(codes.Unauthenticated, "invalid token")
+	}
+	return nil
 }
 
 func setupLogger(logLevel int, loggingInfo LoggingConfig) {
 	output := io.Writer(os.Stderr)
 
+	var handler *log.GlogHandler
 	if loggingInfo.Json {
-		glogger = log.NewGlogHandler(log.JSONHandler(os.Stderr))
+		handler = log.NewGlogHandler(log.JSONHandler(os.Stderr))
 	} else {
 		usecolor := (isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())) && os.Getenv("TERM") != "dumb"
 		if usecolor {
 			output = colorable.NewColorableStderr()
 		}
 
-		glogger = log.NewGlogHandler(log.NewTerminalHandler(output, usecolor))
+		handler = log.NewGlogHandler(log.NewTerminalHandler(output, usecolor))
 	}
 
 	// logging
 	lvl := log.FromLegacyLevel(logLevel)
-	glogger.Verbosity(lvl)
+	handler.Verbosity(lvl)
 
 	if loggingInfo.Vmodule != "" {
-		if err := glogger.Vmodule(loggingInfo.Vmodule); err != nil {
+		if err := handler.Vmodule(loggingInfo.Vmodule); err != nil {
 			log.Error("failed to set Vmodule", "err", err)
 		}
 	}
 
-	log.SetDefault(log.NewLogger(glogger))
+	log.SetDefault(log.NewLogger(handler))
 }
 
 func (s *Server) GetLatestBlockNumber() *big.Int {
@@ -521,7 +614,11 @@ func (s *Server) GetLatestBlockNumber() *big.Int {
 }
 
 func (s *Server) GetGrpcAddr() string {
-	return s.config.GRPC.Addr[1:]
+	// Treat "missing block" as "gRPC disabled" rather than nil-deref.
+	if s.config == nil || s.config.GRPC == nil {
+		return ""
+	}
+	return s.config.GRPC.Addr
 }
 
 // setupHealthService initializes the health service for Bor.
@@ -645,8 +742,8 @@ func (s *Server) customHealthServiceHandler() http.Handler {
 
 		healthResponse["node_info"] = s.getBorInfo()
 
-		status := s.performHealthChecks(healthResponse)
-		healthResponse["status"] = status
+		sts := s.performHealthChecks(healthResponse)
+		healthResponse["status"] = sts
 
 		healthResponse["error"] = false
 		healthResponse["error_message"] = ""

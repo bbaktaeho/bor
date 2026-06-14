@@ -44,11 +44,12 @@ func init() {
 type stateMap = map[common.Address]*account
 
 type account struct {
-	Balance *big.Int                    `json:"balance,omitempty"`
-	Code    []byte                      `json:"code,omitempty"`
-	Nonce   uint64                      `json:"nonce,omitempty"`
-	Storage map[common.Hash]common.Hash `json:"storage,omitempty"`
-	empty   bool
+	Balance  *big.Int                    `json:"balance,omitempty"`
+	Code     []byte                      `json:"code,omitempty"`
+	CodeHash *common.Hash                `json:"codeHash,omitempty"`
+	Nonce    uint64                      `json:"nonce,omitempty"`
+	Storage  map[common.Hash]common.Hash `json:"storage,omitempty"`
+	empty    bool
 }
 
 func (a *account) exists() bool {
@@ -131,7 +132,15 @@ func (t *prestateTracer) OnOpcode(pc uint64, opcode byte, gas, cost uint64, scop
 		t.lookupAccount(addr)
 
 		if op == vm.SELFDESTRUCT {
-			t.deleted[caller] = true
+			if t.chainConfig.IsCancun(t.env.BlockNumber) {
+				// EIP-6780: only delete if created in same transaction
+				if t.created[caller] {
+					t.deleted[caller] = true
+				}
+			} else {
+				// Pre-EIP-6780: always delete
+				t.deleted[caller] = true
+			}
 		}
 	case stackLen >= 5 && (op == vm.DELEGATECALL || op == vm.CALL || op == vm.STATICCALL || op == vm.CALLCODE):
 		addr := common.Address(stackData[stackLen-2].Bytes20())
@@ -166,6 +175,20 @@ func (t *prestateTracer) OnOpcode(pc uint64, opcode byte, gas, cost uint64, scop
 
 func (t *prestateTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction, from common.Address) {
 	t.env = env
+	t.lookupAccount(env.Coinbase)
+
+	// For bor state-sync transactions, the `from` and `to` fields of the tx object are zero address
+	// while we use the system address and state receiver contract address as `from` and `to`
+	// respectively for the top level synthetic frame (see `state_sync_tracing_hooks.go` for
+	// more context). Hence we load the actual accounts here to avoid panic in later calls.
+	if tx.Type() == types.StateSyncTxType {
+		t.lookupAccount(params.BorSystemAddress)
+		if t.chainConfig.Bor != nil {
+			t.lookupAccount(common.HexToAddress(t.chainConfig.Bor.StateReceiverContract))
+		}
+		return
+	}
+
 	if tx.To() == nil {
 		t.to = crypto.CreateAddress(from, env.StateDB.GetNonce(from))
 		t.created[t.to] = true
@@ -182,7 +205,6 @@ func (t *prestateTracer) OnTxStart(env *tracing.VMContext, tx *types.Transaction
 
 	t.lookupAccount(from)
 	t.lookupAccount(t.to)
-	t.lookupAccount(env.Coinbase)
 
 	// Add accounts with authorizations to the prestate before they get applied.
 	for _, auth := range tx.SetCodeAuthorizations() {
@@ -249,6 +271,7 @@ func (t *prestateTracer) processDiffState() {
 		postAccount := &account{Storage: make(map[common.Hash]common.Hash)}
 		newBalance := t.env.StateDB.GetBalance(addr).ToBig()
 		newNonce := t.env.StateDB.GetNonce(addr)
+		newCodeHash := t.env.StateDB.GetCodeHash(addr)
 
 		if newBalance.Cmp(t.pre[addr].Balance) != 0 {
 			modified = true
@@ -258,6 +281,19 @@ func (t *prestateTracer) processDiffState() {
 		if newNonce != t.pre[addr].Nonce {
 			modified = true
 			postAccount.Nonce = newNonce
+		}
+		prevCodeHash := common.Hash{}
+		if t.pre[addr].CodeHash != nil {
+			prevCodeHash = *t.pre[addr].CodeHash
+		}
+		// Empty code hashes are excluded from the prestate. Normalize
+		// the empty code hash to a zero hash to make it comparable.
+		if newCodeHash == types.EmptyCodeHash {
+			newCodeHash = common.Hash{}
+		}
+		if newCodeHash != prevCodeHash {
+			modified = true
+			postAccount.CodeHash = &newCodeHash
 		}
 		if !t.config.DisableCode {
 			newCode := t.env.StateDB.GetCode(addr)
@@ -308,6 +344,11 @@ func (t *prestateTracer) lookupAccount(addr common.Address) {
 		Nonce:   t.env.StateDB.GetNonce(addr),
 		Code:    t.env.StateDB.GetCode(addr),
 	}
+	codeHash := t.env.StateDB.GetCodeHash(addr)
+	// If the code is empty, we don't need to store it in the prestate.
+	if codeHash != (common.Hash{}) && codeHash != types.EmptyCodeHash {
+		acc.CodeHash = &codeHash
+	}
 	if !acc.exists() {
 		acc.empty = true
 	}
@@ -322,12 +363,18 @@ func (t *prestateTracer) lookupAccount(addr common.Address) {
 }
 
 // lookupStorage fetches the requested storage slot and adds
-// it to the prestate of the given contract. It assumes `lookupAccount`
-// has been performed on the contract before.
+// it to the prestate of the given contract. Earlier it assumed
+// that `lookupAccount` has been performed on the contract before
+// but as a defensive measure for state-sync transactions, we perform
+// `lookupAccount` here to ensure there is no panic. This helps in
+// cases where SLOAD/SSTORE fires for an account which wasn't introduced
+// earlier (via lookup). E.g. in state-sync top level synthetic call. If
+// an account is already loaded, it's a no-op.
 func (t *prestateTracer) lookupStorage(addr common.Address, key common.Hash) {
 	if t.config.DisableStorage {
 		return
 	}
+	t.lookupAccount(addr)
 	if _, ok := t.pre[addr].Storage[key]; ok {
 		return
 	}

@@ -55,6 +55,21 @@ func (mr *MockDatabaseMockRecorder) Ancient(kind, number any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Ancient", reflect.TypeOf((*MockDatabase)(nil).Ancient), kind, number)
 }
 
+// AncientBytes mocks base method.
+func (m *MockDatabase) AncientBytes(kind string, id, offset, length uint64) ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AncientBytes", kind, id, offset, length)
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AncientBytes indicates an expected call of AncientBytes.
+func (mr *MockDatabaseMockRecorder) AncientBytes(kind, id, offset, length any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AncientBytes", reflect.TypeOf((*MockDatabase)(nil).AncientBytes), kind, id, offset, length)
+}
+
 // AncientDatadir mocks base method.
 func (m *MockDatabase) AncientDatadir() (string, error) {
 	m.ctrl.T.Helper()
@@ -215,21 +230,6 @@ func (mr *MockDatabaseMockRecorder) Has(key any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Has", reflect.TypeOf((*MockDatabase)(nil).Has), key)
 }
 
-// HasAncient mocks base method.
-func (m *MockDatabase) HasAncient(kind string, number uint64) (bool, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "HasAncient", kind, number)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// HasAncient indicates an expected call of HasAncient.
-func (mr *MockDatabaseMockRecorder) HasAncient(kind, number any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasAncient", reflect.TypeOf((*MockDatabase)(nil).HasAncient), kind, number)
-}
-
 // ItemAmountInAncient mocks base method.
 func (m *MockDatabase) ItemAmountInAncient() (uint64, error) {
 	m.ctrl.T.Helper()
@@ -345,20 +345,6 @@ func (mr *MockDatabaseMockRecorder) Stat() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockDatabase)(nil).Stat))
 }
 
-// SyncKeyValue mocks base method.
-func (m *MockDatabase) SyncKeyValue() error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "SyncKeyValue")
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// SyncKeyValue indicates an expected call of SyncKeyValue.
-func (mr *MockDatabaseMockRecorder) SyncKeyValue() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncKeyValue", reflect.TypeOf((*MockDatabase)(nil).SyncKeyValue))
-}
-
 // SyncAncient mocks base method.
 func (m *MockDatabase) SyncAncient() error {
 	m.ctrl.T.Helper()
@@ -371,6 +357,20 @@ func (m *MockDatabase) SyncAncient() error {
 func (mr *MockDatabaseMockRecorder) SyncAncient() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncAncient", reflect.TypeOf((*MockDatabase)(nil).SyncAncient))
+}
+
+// SyncKeyValue mocks base method.
+func (m *MockDatabase) SyncKeyValue() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SyncKeyValue")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SyncKeyValue indicates an expected call of SyncKeyValue.
+func (mr *MockDatabaseMockRecorder) SyncKeyValue() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncKeyValue", reflect.TypeOf((*MockDatabase)(nil).SyncKeyValue))
 }
 
 // Tail mocks base method.

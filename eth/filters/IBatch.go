@@ -54,6 +54,20 @@ func (mr *MockBatchMockRecorder) Delete(key any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockBatch)(nil).Delete), key)
 }
 
+// DeleteRange mocks base method.
+func (m *MockBatch) DeleteRange(start, end []byte) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DeleteRange", start, end)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DeleteRange indicates an expected call of DeleteRange.
+func (mr *MockBatchMockRecorder) DeleteRange(start, end any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteRange", reflect.TypeOf((*MockBatch)(nil).DeleteRange), start, end)
+}
+
 // Put mocks base method.
 func (m *MockBatch) Put(key, value []byte) error {
 	m.ctrl.T.Helper()
@@ -120,16 +134,4 @@ func (m *MockBatch) Write() error {
 func (mr *MockBatchMockRecorder) Write() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Write", reflect.TypeOf((*MockBatch)(nil).Write))
-}
-
-func (m *MockBatch) DeleteRange(start, end []byte) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeleteRange", start, end)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-func (mr *MockBatchMockRecorder) DeleteRange(start, end any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteRange", reflect.TypeOf((*MockBatch)(nil).DeleteRange), start, end)
 }

@@ -21,10 +21,11 @@ import (
 	"math/big"
 	"sync/atomic"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/holiman/uint256"
 )
 
 // txWithMinerFee wraps a transaction with its gas price or effective miner gasTipCap
@@ -188,4 +189,25 @@ func (t *transactionsByPriceAndNonce) Empty() bool {
 // Clear removes the entire content of the heap.
 func (t *transactionsByPriceAndNonce) Clear() {
 	t.heads, t.txs = nil, nil
+}
+
+// clone returns a shallow copy of the heap suitable for non-destructive scanning.
+// LazyTransaction pointers are shared with the original; only the per-account queue
+// slices and the heads slice are newly allocated. The heap invariant is preserved in
+// the copy because we duplicate the slice in its current heap-ordered state.
+func (t *transactionsByPriceAndNonce) clone() *transactionsByPriceAndNonce {
+	clonedTxs := make(map[common.Address][]*txpool.LazyTransaction, len(t.txs))
+	for addr, queue := range t.txs {
+		c := make([]*txpool.LazyTransaction, len(queue))
+		copy(c, queue)
+		clonedTxs[addr] = c
+	}
+	clonedHeads := make(txByPriceAndTime, len(t.heads))
+	copy(clonedHeads, t.heads)
+	return &transactionsByPriceAndNonce{
+		txs:     clonedTxs,
+		heads:   clonedHeads,
+		signer:  t.signer,
+		baseFee: t.baseFee,
+	}
 }

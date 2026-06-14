@@ -4,6 +4,7 @@ package whitelist
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"sort"
@@ -72,7 +73,6 @@ func NewMockService(db ethdb.Database) *Service {
 			MaxCapacity:          10,
 		},
 		maxForkCorrectnessLimit: 10,
-		lastValidForkBlock:      0,
 		forkValidationCache:     make(map[common.Hash]bool, 10),
 	}
 }
@@ -1374,7 +1374,7 @@ func TestForkCorrectness(t *testing.T) {
 
 		res := s.checkForkCorrectness(chainA[16:]) // 11 blocks ahead of last checkpoint
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, uint64(0), s.lastValidForkBlock, "expected last known valid block to be 0")
+		require.Equal(t, uint64(0), s.lastValidForkBlock.Load(), "expected last known valid block to be 0")
 		require.Equal(t, 0, len(s.forkValidationCache), "expected no entries in cache")
 	})
 
@@ -1384,7 +1384,7 @@ func TestForkCorrectness(t *testing.T) {
 
 		res := s.checkForkCorrectness(chainA[16:]) // 12 blocks ahead of last milestone
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, uint64(0), s.lastValidForkBlock, "expected last known valid block to be 0")
+		require.Equal(t, uint64(0), s.lastValidForkBlock.Load(), "expected last known valid block to be 0")
 		require.Equal(t, 0, len(s.forkValidationCache), "expected no entries in cache")
 	})
 
@@ -1394,12 +1394,12 @@ func TestForkCorrectness(t *testing.T) {
 
 		res := s.checkForkCorrectness(chainA[16:]) // 12 blocks ahead of last milestone
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, uint64(0), s.lastValidForkBlock, "expected last known valid block to be 0")
+		require.Equal(t, uint64(0), s.lastValidForkBlock.Load(), "expected last known valid block to be 0")
 		require.Equal(t, 0, len(s.forkValidationCache), "expected no entries in cache")
 	})
 
 	t.Run("long fork: both milestone and checkpoint exist but last known block is recent", func(t *testing.T) {
-		s.lastValidForkBlock = 6 // 1 block ahead of last checkpoint
+		s.lastValidForkBlock.Store(6) // 1 block ahead of last checkpoint
 
 		res := s.checkForkCorrectness(chainA[17:]) // 11 blocks ahead of last known block
 		require.Equal(t, true, res, "expected chain to be valid")
@@ -1413,7 +1413,7 @@ func TestForkCorrectness(t *testing.T) {
 		res := s.checkForkCorrectness(chainA[17:]) // 11 blocks ahead of last known block
 		require.Equal(t, true, res, "expected chain to be valid")
 		require.Equal(t, 0, len(s.forkValidationCache), "expected no entries in cache")
-		s.lastValidForkBlock = 0
+		s.lastValidForkBlock.Store(0)
 	})
 
 	// Create a mock chain linking back to last block
@@ -1428,7 +1428,7 @@ func TestForkCorrectness(t *testing.T) {
 
 		res := s.checkForkCorrectness(chain1)
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, chain1[1].Number.Uint64(), s.lastValidForkBlock, "expected last known valid block to be updated")
+		require.Equal(t, chain1[1].Number.Uint64(), s.lastValidForkBlock.Load(), "expected last known valid block to be updated")
 		require.Equal(t, 2, len(s.forkValidationCache), "expected two entries in cache")
 		require.Equal(t, true, s.forkValidationCache[chain1[0].Hash()], "expected cache to have valid entry")
 		require.Equal(t, true, s.forkValidationCache[chain1[1].Hash()], "expected cache to have valid entry")
@@ -1443,7 +1443,7 @@ func TestForkCorrectness(t *testing.T) {
 	t.Run("incoming chain further ahead of last chain", func(t *testing.T) {
 		res := s.checkForkCorrectness(chain2)
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, chain2[1].Number.Uint64(), s.lastValidForkBlock, "expected last known valid block to be updated")
+		require.Equal(t, chain2[1].Number.Uint64(), s.lastValidForkBlock.Load(), "expected last known valid block to be updated")
 		require.Equal(t, 4, len(s.forkValidationCache), "expected four entries in cache") // block 21, 22, 23, 24 should be present in cache
 		require.Equal(t, true, s.forkValidationCache[chain1[0].Hash()], "expected cache to have valid entry: block 21")
 		require.Equal(t, true, s.forkValidationCache[chain1[1].Hash()], "expected cache to have valid entry: block 22")
@@ -1467,7 +1467,7 @@ func TestForkCorrectness(t *testing.T) {
 
 		// The last valid fork block shouldn't be updated as we couldn't verify the chain
 		// due to missing header. The cache except for the explicit deletion should be intact.
-		require.Equal(t, chain2[1].Number.Uint64(), s.lastValidForkBlock, "expected last known valid block to be unchanged")
+		require.Equal(t, chain2[1].Number.Uint64(), s.lastValidForkBlock.Load(), "expected last known valid block to be unchanged")
 		require.Equal(t, 3, len(s.forkValidationCache), "expected three entries in cache") // block 21, 22, 23 should be present in cache
 		require.Equal(t, true, s.forkValidationCache[chain1[0].Hash()], "expected cache to have valid entry: block 21")
 		require.Equal(t, true, s.forkValidationCache[chain1[1].Hash()], "expected cache to have valid entry: block 22")
@@ -1485,7 +1485,7 @@ func TestForkCorrectness(t *testing.T) {
 		// The fork should be valid as block 24 is present in cache (even though header is not available)
 		res := s.checkForkCorrectness(chain3)
 		require.Equal(t, true, res, "expected chain to be valid")
-		require.Equal(t, chain3[1].Number.Uint64(), s.lastValidForkBlock, "expected last known valid block to be updates") // block 26
+		require.Equal(t, chain3[1].Number.Uint64(), s.lastValidForkBlock.Load(), "expected last known valid block to be updates") // block 26
 
 		require.Equal(t, 6, len(s.forkValidationCache), "expected six entries in cache") // block 21, 22, 23, 24, 25, 26 should be present in cache
 		require.Equal(t, true, s.forkValidationCache[chain1[0].Hash()], "expected cache to have valid entry: block 21")
@@ -1530,6 +1530,64 @@ func TestForkCorrectness(t *testing.T) {
 		res := s.checkForkCorrectness(chain4[1:])
 		require.Equal(t, false, res, "expected chain to be invalid due to mismatch with milestone")
 		require.Equal(t, 0, len(s.forkValidationCache), "expected no entries in cache")
-		require.Equal(t, chain3[1].Number.Uint64(), s.lastValidForkBlock, "expected last known valid block to be unchanged")
+		require.Equal(t, chain3[1].Number.Uint64(), s.lastValidForkBlock.Load(), "expected last known valid block to be unchanged")
 	})
+}
+
+// TestNewServiceDiscardsInvalidLockedMilestone verifies that NewService detects and clears
+// a LockedMilestoneNumber that is beyond the safe range when loading from DB.
+func TestNewServiceDiscardsInvalidLockedMilestone(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+
+	// Write a locked milestone with an unreachable block number to the DB,
+	// simulating a previously corrupted state.
+	lockedIDs := map[string]struct{}{"bad-id": {}}
+	err := rawdb.WriteLockField(db, true, math.MaxUint64, common.Hash{0xAB}, lockedIDs)
+	require.NoError(t, err)
+
+	// NewService should detect the out-of-range value and clear it.
+	svc := NewService(db, false, 0)
+
+	m, ok := svc.milestoneService.(*milestone)
+	require.True(t, ok)
+
+	m.finality.RLock()
+	defer m.finality.RUnlock()
+
+	require.False(t, m.Locked, "expected Locked to be false after discarding invalid milestone")
+	require.Equal(t, uint64(0), m.LockedMilestoneNumber, "expected LockedMilestoneNumber to be reset to 0")
+	require.Equal(t, common.Hash{}, m.LockedMilestoneHash, "expected LockedMilestoneHash to be reset")
+	require.Empty(t, m.LockedMilestoneIDs, "expected LockedMilestoneIDs to be cleared")
+
+	// Verify the corrected state was persisted to DB.
+	locked, lockedNum, lockedHash, ids, err := rawdb.ReadLockField(db)
+	require.NoError(t, err)
+	require.False(t, locked)
+	require.Equal(t, uint64(0), lockedNum)
+	require.Equal(t, common.Hash{}, lockedHash)
+	require.Empty(t, ids)
+}
+
+// TestNewServicePreservesValidLockedMilestone verifies that NewService does not
+// interfere with a legitimate locked milestone stored in DB.
+func TestNewServicePreservesValidLockedMilestone(t *testing.T) {
+	db := rawdb.NewMemoryDatabase()
+
+	expectedHash := common.Hash{0x42}
+	lockedIDs := map[string]struct{}{"valid-id": {}}
+	err := rawdb.WriteLockField(db, true, 1000, expectedHash, lockedIDs)
+	require.NoError(t, err)
+
+	svc := NewService(db, false, 0)
+
+	m, ok := svc.milestoneService.(*milestone)
+	require.True(t, ok)
+
+	m.finality.RLock()
+	defer m.finality.RUnlock()
+
+	require.True(t, m.Locked, "expected Locked to remain true for valid milestone")
+	require.Equal(t, uint64(1000), m.LockedMilestoneNumber)
+	require.Equal(t, expectedHash, m.LockedMilestoneHash)
+	require.Len(t, m.LockedMilestoneIDs, 1)
 }

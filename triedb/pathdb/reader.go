@@ -68,28 +68,59 @@ func (r *reader) Node(owner common.Hash, path []byte, hash common.Hash) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	// Error out if the local one is inconsistent with the target.
-	if !r.noHashCheck && got != hash {
-		// Location is always available even if the node
-		// is not found.
-		switch loc.loc {
-		case locCleanCache:
-			nodeCleanFalseMeter.Mark(1)
-		case locDirtyCache:
-			nodeDirtyFalseMeter.Mark(1)
-		case locDiffLayer:
-			nodeDiffFalseMeter.Mark(1)
-		case locDiskLayer:
-			nodeDiskFalseMeter.Mark(1)
-		}
-		blobHex := "nil"
-		if len(blob) > 0 {
-			blobHex = hexutil.Encode(blob)
-		}
-		log.Error("Unexpected trie node", "location", loc.loc, "owner", owner.Hex(), "path", path, "expect", hash.Hex(), "got", got.Hex(), "blob", blobHex)
-		return nil, fmt.Errorf("unexpected node: (%x %v), %x!=%x, %s, blob: %s", owner, path, hash, got, loc.string(), blobHex)
+	if r.noHashCheck || got == hash {
+		return blob, nil
 	}
-	return blob, nil
+	// Hash mismatch path. The clean-cache writer (the biased preloader's
+	// async Has→Set) is racy: a flusher's Set(newer) can land between the
+	// preloader's Has(absent) and Set(older), poisoning the cache with a
+	// stale blob. Evict the offending cache entry and retry from disk so
+	// the cache self-heals instead of returning the same stale blob until
+	// natural eviction.
+	if loc.loc == locCleanCache {
+		nodeCleanFalseMeter.Mark(1)
+		evictCachedNode(r.layer, owner, path)
+		blob, got, loc, err = r.layer.node(owner, path, 0)
+		if err != nil {
+			return nil, err
+		}
+		if got == hash {
+			return blob, nil
+		}
+		// Still wrong after eviction → backing store is corrupt or the
+		// caller asked for a node that doesn't exist at this state.
+	}
+	switch loc.loc {
+	case locCleanCache:
+		nodeCleanFalseMeter.Mark(1)
+	case locDirtyCache:
+		nodeDirtyFalseMeter.Mark(1)
+	case locDiffLayer:
+		nodeDiffFalseMeter.Mark(1)
+	case locDiskLayer:
+		nodeDiskFalseMeter.Mark(1)
+	}
+	blobHex := "nil"
+	if len(blob) > 0 {
+		blobHex = hexutil.Encode(blob)
+	}
+	log.Error("Unexpected trie node", "location", loc.loc, "owner", owner.Hex(), "path", path, "expect", hash.Hex(), "got", got.Hex(), "blob", blobHex)
+	return nil, fmt.Errorf("unexpected node: (%x %v), %x!=%x, %s, blob: %s", owner, path, hash, got, loc.string(), blobHex)
+}
+
+// evictCachedNode walks the parentLayer chain to find the disk layer and
+// removes the given (owner, path) entry from its clean cache. Used by
+// reader.Node's hash-mismatch retry path.
+func evictCachedNode(l layer, owner common.Hash, path []byte) {
+	for l != nil {
+		if dl, ok := l.(*diskLayer); ok {
+			if dl.nodes != nil {
+				dl.nodes.Del(nodeCacheKey(owner, path))
+			}
+			return
+		}
+		l = l.parentLayer()
+	}
 }
 
 // AccountRLP directly retrieves the account associated with a particular hash.
@@ -207,30 +238,34 @@ type HistoricalStateReader struct {
 // HistoricReader constructs a reader for accessing the requested historic state.
 func (db *Database) HistoricReader(root common.Hash) (*HistoricalStateReader, error) {
 	// Bail out if the state history hasn't been fully indexed
-	if db.indexer == nil || !db.indexer.inited() {
+	if db.stateIndexer == nil || db.stateFreezer == nil {
+		return nil, fmt.Errorf("historical state %x is not available", root)
+	}
+	if !db.stateIndexer.inited() {
 		return nil, errors.New("state histories haven't been fully indexed yet")
 	}
-	if db.freezer == nil {
-		return nil, errors.New("state histories are not available")
-	}
-	// States at the current disk layer or above are directly accessible via
-	// db.StateReader.
+	// - States at the current disk layer or above are directly accessible
+	//   via `db.StateReader`.
 	//
-	// States older than the current disk layer (including the disk layer
-	// itself) are available through historic state access.
-	//
-	// Note: the requested state may refer to a stale historic state that has
-	// already been pruned. This function does not validate availability, as
-	// underlying states may be pruned dynamically. Validity is checked during
-	// each actual state retrieval.
+	// - States older than the current disk layer (including the disk layer
+	//   itself) are available via `db.HistoricReader`.
 	id := rawdb.ReadStateID(db.diskdb, root)
 	if id == nil {
 		return nil, fmt.Errorf("state %#x is not available", root)
 	}
+	// Ensure the requested state is canonical, historical states on side chain
+	// are not accessible.
+	meta, err := readStateHistoryMeta(db.stateFreezer, *id+1)
+	if err != nil {
+		return nil, err // e.g., the referred state history has been pruned
+	}
+	if meta.parent != root {
+		return nil, fmt.Errorf("state %#x is not canonincal", root)
+	}
 	return &HistoricalStateReader{
 		id:     *id,
 		db:     db,
-		reader: newHistoryReader(db.diskdb, db.freezer),
+		reader: newHistoryReader(db.diskdb, db.stateFreezer),
 	}, nil
 }
 

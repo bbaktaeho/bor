@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -27,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p/tracker"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -34,7 +36,15 @@ import (
 )
 
 // requestTracker is a singleton tracker for eth/66 and newer request times.
-var requestTracker = tracker.New(ProtocolName, 5*time.Minute)
+var (
+	requestTracker = tracker.New(ProtocolName, 5*time.Minute)
+
+	// newBlockPushIntervalTimer tracks time deltas between consecutive inbound NewBlock pushes.
+	newBlockPushIntervalTimer = metrics.NewRegisteredTimer("eth/protocols/eth/newblock/push_interval", nil)
+
+	// lastNewBlockPushUnix holds the timestamp (unix nanos) when the last push arrived.
+	lastNewBlockPushUnix atomic.Int64
+)
 
 func handleGetBlockHeaders(backend Backend, msg Decoder, peer *Peer) error {
 	// Decode the complex header query
@@ -307,12 +317,15 @@ func ServiceGetReceiptsQuery68(chain *core.BlockChain, query GetReceiptsRequest)
 			lookups >= 2*maxReceiptsServe {
 			break
 		}
-		// Retrieve the requested block's receipts
+		// Retrieve the requested block's receipts. If receipts are empty
+		// replace the result with an rlp.EmptyList to encode in the final
+		// response.
 		results := chain.GetReceiptsRLP(hash)
-		if results == nil {
+		if len(results) == 0 {
 			if header := chain.GetHeaderByHash(hash); header == nil || header.ReceiptHash != types.EmptyRootHash {
 				continue
 			}
+			results = rlp.EmptyList
 		} else {
 			body := chain.GetBodyRLP(hash)
 			if body == nil {
@@ -346,19 +359,22 @@ func ServiceGetReceiptsQuery69(chain *core.BlockChain, query GetReceiptsRequest)
 			break
 		}
 
-		number := rawdb.ReadHeaderNumber(chain.DB(), hash)
-		if number == nil {
+		number, ok := rawdb.ReadHeaderNumber(chain.DB(), hash)
+		if !ok {
 			continue
 		}
 
 		// If we're past the Madhugiri hardfork, state-sync receipts (if present) are stored
 		// with normal block receipts so no special handling needed.
-		if borCfg != nil && borCfg.IsMadhugiri(big.NewInt(int64(*number))) {
+		if borCfg != nil && borCfg.IsMadhugiri(big.NewInt(int64(number))) {
 			allReceipts := chain.GetReceiptsRLP(hash)
-			if allReceipts == nil {
+			if len(allReceipts) == 0 {
 				if header := chain.GetHeaderByHash(hash); header == nil || header.ReceiptHash != types.EmptyRootHash {
 					continue
 				}
+				// If receipts are empty, replace the result with an rlp.EmptyList
+				// to encode in the final response.
+				allReceipts = rlp.EmptyList
 			}
 			body := chain.GetBodyRLP(hash)
 			if body == nil {
@@ -384,7 +400,7 @@ func ServiceGetReceiptsQuery69(chain *core.BlockChain, query GetReceiptsRequest)
 		// the final list to be sent over p2p.
 		normalReceipts := chain.GetReceiptsRLP(hash)
 		var normalReceiptsDecoded []*types.ReceiptForStorage
-		if normalReceipts != nil {
+		if len(normalReceipts) != 0 {
 			if err := rlp.DecodeBytes(normalReceipts, &normalReceiptsDecoded); err != nil {
 				log.Error("Failed to decode normal receipts", "err", err)
 				continue
@@ -394,15 +410,15 @@ func ServiceGetReceiptsQuery69(chain *core.BlockChain, query GetReceiptsRequest)
 		// Fetch state-sync transaction receipt (if any)
 		borReceipt := chain.GetBorReceiptRLPByHash(hash)
 		var borReceiptDecoded types.ReceiptForStorage
-		if borReceipt != nil {
+		if len(borReceipt) != 0 {
 			if err := rlp.DecodeBytes(borReceipt, &borReceiptDecoded); err != nil {
 				log.Error("Failed to decode state-sync receipt", "err", err)
 				continue
 			}
 		}
 
-		// Check if receipts are nil due to non existence or something else
-		if normalReceipts == nil && borReceipt == nil {
+		// Check if receipts are absent due to non existence or something else
+		if len(normalReceipts) == 0 && len(borReceipt) == 0 {
 			// Don't append empty receipt data for this block if either the local header is nil
 			// or the receipt root of header denotes existence of receipt (i.e. is not empty hash)
 			if header := chain.GetHeaderByHash(hash); header == nil || header.ReceiptHash != types.EmptyRootHash {
@@ -413,12 +429,12 @@ func ServiceGetReceiptsQuery69(chain *core.BlockChain, query GetReceiptsRequest)
 		// Track existence of bor receipts for encoding
 		var isBorReceiptPresent bool
 
-		// We atleast have some non-nil data for this block. Combine the receipts for encoding.
+		// We at least have some non-empty data for this block. Combine the receipts for encoding.
 		var blockReceipts []*types.ReceiptForStorage = make([]*types.ReceiptForStorage, 0)
-		if normalReceipts != nil {
+		if len(normalReceipts) != 0 {
 			blockReceipts = append(blockReceipts, normalReceiptsDecoded...)
 		}
-		if borReceipt != nil {
+		if len(borReceipt) != 0 {
 			isBorReceiptPresent = true
 			blockReceipts = append(blockReceipts, &borReceiptDecoded)
 		}
@@ -491,7 +507,14 @@ func handleNewBlock(backend Backend, msg Decoder, peer *Peer) error {
 	}
 
 	msgTime := msg.Time()
-	ann.Block.ReceivedAt = msg.Time()
+	if prev := lastNewBlockPushUnix.Load(); prev > 0 {
+		if delta := msgTime.Sub(time.Unix(0, prev)); delta > 0 {
+			newBlockPushIntervalTimer.Update(delta)
+		}
+	}
+	lastNewBlockPushUnix.Store(msgTime.UnixNano())
+
+	ann.Block.ReceivedAt = msgTime
 	ann.Block.ReceivedFrom = peer
 	ann.Block.AnnouncedAt = &msgTime
 
@@ -630,13 +653,13 @@ func encodeReceiptsAndPrepareHasher[L ReceiptsList](receipts []L, borCfg *params
 
 	hasher := trie.NewStackTrie(nil)
 	calculateReceiptHashes := func(index int, number *big.Int) common.Hash {
-		// Don't exclude state-sync receipts for post hardfork blocks
-		if borCfg.IsMadhugiri(number) {
-			return types.DeriveSha(receipts[index], hasher)
-		} else {
-			receipts[index].ExcludeStateSyncReceipt()
+		// For non-bor chains or post-Madhugiri blocks, include all receipts in hash
+		if borCfg == nil || borCfg.IsMadhugiri(number) {
 			return types.DeriveSha(receipts[index], hasher)
 		}
+		// Pre-Madhugiri bor blocks: exclude state-sync receipt from hash calculation
+		receipts[index].ExcludeStateSyncReceipt()
+		return types.DeriveSha(receipts[index], hasher)
 	}
 
 	return encodedReceipts, calculateReceiptHashes
@@ -707,14 +730,20 @@ func handleTransactions(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(&txs); err != nil {
 		return err
 	}
-
+	// Duplicate transactions are not allowed
+	seen := make(map[common.Hash]struct{})
 	for i, tx := range txs {
 		// Validate and mark the remote transaction
 		if tx == nil {
 			return fmt.Errorf("Transactions: transaction %d is nil", i)
 		}
 
-		peer.markTransaction(tx.Hash())
+		hash := tx.Hash()
+		if _, exists := seen[hash]; exists {
+			return fmt.Errorf("Transactions: multiple copies of the same hash %v", hash)
+		}
+		seen[hash] = struct{}{}
+		peer.markTransaction(hash)
 	}
 
 	return backend.Handle(peer, &txs)
@@ -730,13 +759,20 @@ func handlePooledTransactions(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(&txs); err != nil {
 		return err
 	}
+	// Duplicate transactions are not allowed
+	seen := make(map[common.Hash]struct{})
 	for i, tx := range txs.PooledTransactionsResponse {
 		// Validate and mark the remote transaction
 		if tx == nil {
 			return fmt.Errorf("PooledTransactions: transaction %d is nil", i)
 		}
 
-		peer.markTransaction(tx.Hash())
+		hash := tx.Hash()
+		if _, exists := seen[hash]; exists {
+			return fmt.Errorf("PooledTransactions: multiple copies of the same hash %v", hash)
+		}
+		seen[hash] = struct{}{}
+		peer.markTransaction(hash)
 	}
 
 	requestTracker.Fulfil(peer.id, peer.version, PooledTransactionsMsg, txs.RequestId)

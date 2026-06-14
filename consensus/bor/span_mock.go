@@ -50,17 +50,17 @@ func (m *MockSpanner) EXPECT() *MockSpannerMockRecorder {
 }
 
 // CommitSpan mocks base method.
-func (m *MockSpanner) CommitSpan(ctx context.Context, minimalSpan types.Span, validators, producers []types0.MinimalVal, arg4 vm.StateDB, header *types1.Header, chainContext core.ChainContext) error {
+func (m *MockSpanner) CommitSpan(ctx context.Context, minimalSpan types.Span, validators, producers []types0.MinimalVal, arg4 vm.StateDB, header *types1.Header, chainContext core.ChainContext, vmCfg vm.Config) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CommitSpan", ctx, minimalSpan, validators, producers, arg4, header, chainContext)
+	ret := m.ctrl.Call(m, "CommitSpan", ctx, minimalSpan, validators, producers, arg4, header, chainContext, vmCfg)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // CommitSpan indicates an expected call of CommitSpan.
-func (mr *MockSpannerMockRecorder) CommitSpan(ctx, minimalSpan, validators, producers, arg4, header, chainContext any) *gomock.Call {
+func (mr *MockSpannerMockRecorder) CommitSpan(ctx, minimalSpan, validators, producers, arg4, header, chainContext, vmCfg any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CommitSpan", reflect.TypeOf((*MockSpanner)(nil).CommitSpan), ctx, minimalSpan, validators, producers, arg4, header, chainContext)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CommitSpan", reflect.TypeOf((*MockSpanner)(nil).CommitSpan), ctx, minimalSpan, validators, producers, arg4, header, chainContext, vmCfg)
 }
 
 // GetCurrentSpan mocks base method.

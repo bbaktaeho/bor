@@ -2,20 +2,26 @@ chain = "amoy"
 # identity = "node_name"
 # verbosity = 3
 # vmdebug = false
+# vmtrace = ""
+# "vmtrace.jsonconfig" = "{}"
 datadir = "/var/lib/bor/data"
 # ancient = ""
 # db.engine = "pebble"
 # keystore = ""
-# "rpc.batchlimit" = 100
+# "rpc.batch-request-limit" = 1000
 # "rpc.returndatalimit" = 100000
 syncmode = "full"
 # gcmode = "full"
 # snapshot = true
 # ethstats = ""
-# witnessprotocol = false
 # devfakeauthor = false
 
 # ["eth.requiredblocks"]
+
+# [relay]
+# enable-preconfs = true
+# enable-private-tx = true
+# bp-rpc-endpoints = [ ]
 
 # [log]
     # vmodule = ""
@@ -35,12 +41,13 @@ syncmode = "full"
     # nodekeyhex = ""
     # txarrivalwait = "500ms"
     # txannouncementonly = false
+    # disable-tx-propagation = false
     [p2p.discovery]
         # v5disc = true
         # bootnodesv4 = []
         # bootnodesv5 = []
         # bootnodes = []
-        static-nodes = [ "enode://0ef8758cafc0063405f3f31fe22f2a3b566aa871bd7cd405e35954ec8aa7237c21e1ccc1f65f1b6099ab36db029362bc2fecf001a771b3d9803bbf1968508cef@35.197.249.21:30303", "enode://c9c8c18cde48b41d46ced0c564496aef721a9b58f8724025a0b1f3f26f1b826f31786f890f8f8781e18b16dbb3c7bff805c7304d1273ac11630ed25a3f0dc41c@34.89.39.114:30303", "enode://5b8d436677fb545b1c3fd1ae84553d478d9d21ad3b06a908b9d34d2df367ead5bb8823d84a370e26bdde8896ba8a870e21ba3a6dce19c0ded086296df5f04f15@35.242.167.175:30303", "enode://a2ec3671e553ba3e711639033912be55fe1e7fa4b61a93f6a1ac0cd3cea34f9d7eec1d718e04049531cf5dd7efc1ac677df1cf0e1f24f5e677706d7bcb3917de@34.105.128.110:30303", "enode://9e15bc58779c32119140d54a8384940b57a10a001506ce173cc4cdb10876b14a2ac9ae91f9389caf9fd385c3b72825f8bbbe937e7e57b1f032561703e900da59@34.89.21.99:30303", "enode://42203e9b423aba24e1e9386f94d0d0397a42770427e8e9e22f9e2a9523f66abb13b1f5a6addee68ad5986f94a8f6de626f5829492599a2f9484f98e86e26149d@34.89.101.16:30303" ]
+        static-nodes = [ "enode://bb34e633b1b9dad359c4dbb896b6283232bb198ad843b50b631889da54b9d2ab85abed03c79d306175b6c6cfd5a4c98312cdf5f4eea4603c7b123c4aa328579c@34.89.255.109:30303", "enode://b65beebaa7c7336f3ff9e87873d8f114010369d3e81383ddf3a8ffe1348767f05ca62d12b2a3b8564ba26b2d74c9b37e70783169b41fcab8b016566d65ea3500@34.185.137.160:30303", "enode://71f5bbf43d878d0ce85935072ed9d21c794b0fd6a30503c1ad8064cfe12401331ea7edfba5288d4f83cd575b2cacf1cbdc91edbbec91470c193f98acf78fb04d@34.89.119.250:30303", "enode://2c363f4157582e2598dbdde6b916f41ec5b86ee116f857ea86845722b7e111d1adacfd9608c7c2dcfb5cba639a07a7e7c2c69885207fe32a155ddb87ea74e891@34.89.40.235:30303" ]
         # trusted-nodes = []
         dns = [ "enrtree://AKUEZKN7PSKVNR65FZDHECMKOJQSGPARGTPPBI7WS2VUL4EGR6XPC@amoy.polygon-peers.io" ]
 
@@ -79,6 +86,8 @@ syncmode = "full"
     # txfeecap = 5.0
     # allow-unprotected-txs = false
     # enabledeprecatedpersonal = false
+    # accept-preconf-tx = false
+    # accept-private-tx = false
     [jsonrpc.http]
         enabled = true
         port = 8545
@@ -179,6 +188,9 @@ syncmode = "full"
   # enable = true
   # procs = 8
   # enforce = false
+
+# [witness]
+#   enable = false
 
 # [pprof]
 #   pprof = false

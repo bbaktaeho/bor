@@ -21,7 +21,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"sync/atomic"
+
+	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
 	cmath "github.com/ethereum/go-ethereum/common/math"
@@ -30,7 +31,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/holiman/uint256"
 )
 
 // ExecutionResult includes all output after executing given evm
@@ -226,16 +226,25 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 // the gas used (which includes gas refunds) and an error if it failed. An error always
 // indicates a core error meaning that the message would always fail for that particular
 // state and would never be accepted within a block.
-func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool, interrupt *atomic.Bool) (*ExecutionResult, error) {
+func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
 	evm.SetTxContext(NewEVMTxContext(msg))
-	return newStateTransition(evm, msg, gp).execute(interrupt)
+	return newStateTransition(evm, msg, gp).execute()
 }
 
-func ApplyMessageNoFeeBurnOrTip(evm *vm.EVM, msg Message, gp *GasPool, interrupt *atomic.Bool) (*ExecutionResult, error) {
+// ApplyMessageNoFeeLog applies the message with inline fee burn/tip but skips
+// the fee transfer log and coinbase balance read. This eliminates the O(N)
+// coinbase ReadDelta that serializes parallel execution.
+func ApplyMessageNoFeeLog(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
+	st := newStateTransition(evm, msg, gp)
+	st.noFeeLog = true
+	return st.execute()
+}
+
+func ApplyMessageNoFeeBurnOrTip(evm *vm.EVM, msg Message, gp *GasPool) (*ExecutionResult, error) {
 	st := newStateTransition(evm, &msg, gp)
 	st.noFeeBurnAndTip = true
 
-	return st.execute(interrupt)
+	return st.execute()
 }
 
 // stateTransition represents a state transition.
@@ -272,6 +281,7 @@ type stateTransition struct {
 	// ExecutionResult, which caller can use the values to update the balance of burner and coinbase account.
 	// This is useful during parallel state transition, where the common account read/write should be minimized.
 	noFeeBurnAndTip bool
+	noFeeLog        bool // If true, skip fee transfer log and coinbase balance read (for parallel execution)
 }
 
 // newStateTransition initialises and returns a new state transition object.
@@ -411,6 +421,9 @@ func (st *stateTransition) preCheck() error {
 		if len(msg.BlobHashes) == 0 {
 			return ErrMissingBlobHashes
 		}
+		if isOsaka && len(msg.BlobHashes) > params.BlobTxMaxBlobs {
+			return ErrTooManyBlobs
+		}
 		for i, hash := range msg.BlobHashes {
 			if !kzg4844.IsValidVersionedHash(hash[:]) {
 				return fmt.Errorf("blob %d has invalid hash version", i)
@@ -454,12 +467,11 @@ func (st *stateTransition) preCheck() error {
 //
 // However if any consensus issue encountered, return the error directly with
 // nil evm execution result.
-func (st *stateTransition) execute(interrupt *atomic.Bool) (*ExecutionResult, error) {
+func (st *stateTransition) execute() (*ExecutionResult, error) {
 	input1 := st.state.GetBalance(st.msg.From)
 
 	var input2 *uint256.Int
-
-	if !st.noFeeBurnAndTip {
+	if !st.noFeeBurnAndTip && !st.noFeeLog {
 		input2 = st.state.GetBalance(st.evm.Context.Coinbase)
 	}
 	// First check this message satisfies all consensus rules before
@@ -564,7 +576,7 @@ func (st *stateTransition) execute(interrupt *atomic.Bool) (*ExecutionResult, er
 		}
 
 		// Execute the transaction's call.
-		ret, st.gasRemaining, vmerr = st.evm.Call(msg.From, st.to(), msg.Data, st.gasRemaining, value, interrupt)
+		ret, st.gasRemaining, vmerr = st.evm.Call(msg.From, st.to(), msg.Data, st.gasRemaining, value)
 	}
 
 	// Record the gas used excluding gas refunds. This value represents the actual
@@ -608,15 +620,21 @@ func (st *stateTransition) execute(interrupt *atomic.Bool) (*ExecutionResult, er
 	amount := new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), effectiveTip)
 
 	var burnAmount *big.Int
-
 	var burntContractAddress common.Address
 
 	if rules.IsLondon {
-		burntContractAddress = common.HexToAddress(st.evm.ChainConfig().Bor.CalculateBurntContract(st.evm.Context.BlockNumber.Uint64()))
-		burnAmount = new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.evm.Context.BaseFee)
-
-		if !st.noFeeBurnAndTip {
-			st.state.AddBalance(burntContractAddress, cmath.BigIntToUint256Int(burnAmount), tracing.BalanceChangeTransfer)
+		// Bor-specific behavior: redirect the burned base fee to a configured
+		// "burnt contract" (a dead address on bor mainnet/amoy). On non-Bor
+		// chain configs (Bor == nil), no credit happens — the base fee is
+		// implicitly burned the upstream go-ethereum way, matching Ethereum
+		// mainnet semantics. Without the nil-guard, Ethereum-spec test
+		// fixtures with Bor == nil panic here.
+		if bor := st.evm.ChainConfig().Bor; bor != nil {
+			burntContractAddress = common.HexToAddress(bor.CalculateBurntContract(st.evm.Context.BlockNumber.Uint64()))
+			burnAmount = new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.evm.Context.BaseFee)
+			if !st.noFeeBurnAndTip {
+				st.state.AddBalance(burntContractAddress, cmath.BigIntToUint256Int(burnAmount), tracing.BalanceChangeTransfer)
+			}
 		}
 	}
 
@@ -628,23 +646,27 @@ func (st *stateTransition) execute(interrupt *atomic.Bool) (*ExecutionResult, er
 			st.evm.AccessEvents.AddAccount(st.evm.Context.Coinbase, true, math.MaxUint64)
 		}
 
-		output1 := new(big.Int).SetBytes(input1.Bytes())
-		output2 := new(big.Int).SetBytes(input2.Bytes())
+		if !st.noFeeLog && st.evm.ChainConfig().Bor != nil {
+			// Bor-specific fee transfer log; non-Bor chains (Ethereum spec)
+			// don't emit it.
+			output1 := new(big.Int).SetBytes(input1.Bytes())
+			output2 := new(big.Int).SetBytes(input2.Bytes())
 
-		// Deprecating transfer log and will be removed in future fork. PLEASE DO NOT USE this transfer log going forward. Parameters won't get updated as expected going forward with EIP1559
-		// add transfer log
-		AddFeeTransferLog(
-			st.state,
+			// Deprecating transfer log and will be removed in future fork. PLEASE DO NOT USE this transfer log going forward. Parameters won't get updated as expected going forward with EIP1559
+			// add transfer log
+			AddFeeTransferLog(
+				st.state,
 
-			msg.From,
-			st.evm.Context.Coinbase,
+				msg.From,
+				st.evm.Context.Coinbase,
 
-			amount,
-			input1.ToBig(),
-			input2.ToBig(),
-			output1.Sub(output1, amount),
-			output2.Add(output2, amount),
-		)
+				amount,
+				input1.ToBig(),
+				input2.ToBig(),
+				output1.Sub(output1, amount),
+				output2.Add(output2, amount),
+			)
+		}
 	}
 
 	return &ExecutionResult{
@@ -707,12 +729,12 @@ func (st *stateTransition) applyAuthorization(auth *types.SetCodeAuthorization) 
 	st.state.SetNonce(authority, auth.Nonce+1, tracing.NonceChangeAuthorization)
 	if auth.Address == (common.Address{}) {
 		// Delegation to zero address means clear.
-		st.state.SetCode(authority, nil)
+		st.state.SetCode(authority, nil, tracing.CodeChangeAuthorizationClear)
 		return nil
 	}
 
 	// Otherwise install delegation to auth.Address.
-	st.state.SetCode(authority, types.AddressToDelegation(auth.Address))
+	st.state.SetCode(authority, types.AddressToDelegation(auth.Address), tracing.CodeChangeAuthorization)
 
 	return nil
 }

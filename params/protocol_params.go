@@ -20,6 +20,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 const (
@@ -69,11 +70,21 @@ const (
 	ColdSloadCostEIP2929         = uint64(2100) // COLD_SLOAD_COST
 	WarmStorageReadCostEIP2929   = uint64(100)  // WARM_STORAGE_READ_COST
 
+	// PIP-88: cold-storage repricing for the Chicago hard fork.
+	// EIP-2929 uses a single COLD_SLOAD_COST for both SLOAD and SSTORE.
+	// PIP-88 splits it into two so SLOAD and SSTORE can scale independently.
+	ColdSloadCostPIP88  uint64 = 5460 // 2100 * 2.6 - COLD_SLOAD_COST surcharge
+	ColdSstoreCostPIP88 uint64 = 2940 // 2100 * 1.4 - COLD_SSTORE_COST surcharge
+
 	// In EIP-2200: SstoreResetGas was 5000.
 	// In EIP-2929: SstoreResetGas was changed to '5000 - COLD_SLOAD_COST'.
 	// In EIP-3529: SSTORE_CLEARS_SCHEDULE is defined as SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST
 	// Which becomes: 5000 - 2100 + 1900 = 4800
 	SstoreClearsScheduleRefundEIP3529 uint64 = SstoreResetGasEIP2200 - ColdSloadCostEIP2929 + TxAccessListStorageKeyGas
+
+	// PIP-88: SSTORE_CLEARS_SCHEDULE recomputed against the PIP-88 COLD_SSTORE_COST.
+	// Which becomes: 5000 - 2940 + 1900 = 3960.
+	SstoreClearsScheduleRefundPIP88 uint64 = SstoreResetGasEIP2200 - ColdSstoreCostPIP88 + TxAccessListStorageKeyGas
 
 	JumpdestGas   uint64 = 1     // Once per JUMPDEST operation.
 	EpochDuration uint64 = 30000 // Duration between proof-of-work epochs.
@@ -130,15 +141,17 @@ const (
 	// Introduced in Tangerine Whistle (Eip 150)
 	CreateBySelfdestructGas uint64 = 25000
 
-	BaseFeeChangeDenominatorPreDelhi   = 8  // Bounds the amount the base fee can change between blocks before Delhi Hard Fork.
+	DefaultBaseFeeChangeDenominator    = 8  // Bounds the amount the base fee can change between blocks.
 	BaseFeeChangeDenominatorPostDelhi  = 16 // Bounds the amount the base fee can change between blocks after Delhi Hard Fork.
 	BaseFeeChangeDenominatorPostBhilai = 64 // Bounds the amount the base fee can change between blocks after Bhilai Hard Fork.
 
-	ElasticityMultiplier = 2          // Bounds the maximum gas limit an EIP-1559 block may have.
-	InitialBaseFee       = 1000000000 // Initial base fee for EIP-1559 blocks.
+	DefaultElasticityMultiplier = 2 // Bounds the maximum gas limit an EIP-1559 block may have.
+	ElasticityMultiplier        = 2 // Bounds the maximum gas limit an EIP-1559 block may have.
 
-	DefaultBaseFeeChangeDenominator = 8 // Bounds the amount the base fee can change between blocks.
-	DefaultElasticityMultiplier     = 2 // Bounds the maximum gas limit an EIP-1559 block may have.
+	InitialBaseFee = 1000000000 // Initial base fee for EIP-1559 blocks.
+
+	DefaultTargetGasPercentage     = 50 // Specifies target block gas as percentage of block gas limit for EIP-1559
+	TargetGasPercentagePostDandeli = 65 // Specifies target block gas as percentage of block gas limit for EIP-1559 after Dandeli hard fork
 
 	MaxCodeSize              = 24576           // Maximum bytecode to permit for a contract
 	MaxCodeSizePostAhmedabad = 32768           // Maximum bytecode to permit for a contract post Ahmedabad hard fork (bor / polygon pos) (32KB)
@@ -172,7 +185,27 @@ const (
 	Bls12381MapG1Gas          uint64 = 5500  // Gas price for BLS12-381 mapping field element to G1 operation
 	Bls12381MapG2Gas          uint64 = 23800 // Gas price for BLS12-381 mapping field element to G2 operation
 
-	P256VerifyGas uint64 = 3450 // secp256r1 elliptic curve signature verifier gas price
+	// PIP-27: secp256r1 elliptic curve signature verifier gas price
+	P256VerifyGas        uint64 = 3450
+	P256VerifyGasEIP7951 uint64 = 6900
+
+	// PIP-88: precompile gas repricing activated by the Chicago hard fork.
+
+	GFROUNDPIP88 uint64 = 22 // PIP-88 GFROUND for blake2F operation
+
+	Bn256AddGasIstanbulPIP88             uint64 = 540   // 150 * 3.6
+	Bn256ScalarMulGasIstanbulPIP88       uint64 = 12600 // 6000 * 2.1
+	Bn256PairingBaseGasIstanbulPIP88     uint64 = 67500 // 45000 * 1.5
+	Bn256PairingPerPointGasIstanbulPIP88 uint64 = 51000 // 34000 * 1.5
+
+	Bls12381G1AddGasPIP88          uint64 = 1050   // 375 * 2.8
+	Bls12381G1MulGasPIP88          uint64 = 73200  // 12000 * 6.1 (k=1)
+	Bls12381G2AddGasPIP88          uint64 = 1620   // 600 * 2.7
+	Bls12381G2MulGasPIP88          uint64 = 144000 // 22500 * 6.4 (k=1)
+	Bls12381PairingBaseGasPIP88    uint64 = 109330 // 37700 * 2.9
+	Bls12381PairingPerPairGasPIP88 uint64 = 94540  // 32600 * 2.9
+	Bls12381MapG1GasPIP88          uint64 = 15400  // 5500 * 2.8
+	Bls12381MapG2GasPIP88          uint64 = 66640  // 23800 * 2.8
 
 	// The Refund Quotient is the cap on how much of the used gas can be refunded. Before EIP-3529,
 	// up to half the consumed gas could be refunded. Redefined as 1/5th in EIP-3529
@@ -184,10 +217,13 @@ const (
 	BlobTxBlobGasPerBlob               = 1 << 17 // Gas consumption of a single data blob (== blob byte size)
 	BlobTxMinBlobGasprice              = 1       // Minimum gas price for data blobs
 	BlobTxPointEvaluationPrecompileGas = 50000   // Gas price for the point evaluation precompile.
+	BlobTxMaxBlobs                     = 6
 
-	HistoryServeWindow = 8192 // Number of blocks to serve historical block hashes for, EIP-2935.
+	HistoryServeWindow = 8191 // Number of blocks to serve historical block hashes for, EIP-2935.
 
-	// BorDefaultMinerGasPrice defines the minimum gas price for bor validators to mine a transaction.
+	MaxBlockSize = 8_388_608 // maximum size of an RLP-encoded block
+
+	// BorDefaultMinerGasPrice defines the minimum gas price to mine a transaction.
 	BorDefaultMinerGasPrice = 25 * GWei
 
 	// BorDefaultTxPoolPriceLimit defines the minimum gas price limit for bor to enforce txs acceptance into the pool.
@@ -210,6 +246,10 @@ var (
 	MinimumDifficulty      = big.NewInt(131072) // The minimum that the difficulty may ever be.
 	DurationLimit          = big.NewInt(13)     // The decision boundary on the blocktime duration used to determine whether difficulty should go up or not.
 )
+
+// BorSystemAddress is used for doing system transactions for processing bor bridge events
+// i.e. state-sync events.
+var BorSystemAddress = common.HexToAddress("0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE")
 
 // System contracts.
 var (
@@ -238,17 +278,30 @@ var (
 // - Pre-Delhi: 8 (default)
 // - Post-Delhi: 16
 // - Post-Bhilai: 64
+// - Post-Lisovo: Configurable via BorConfig.BaseFeeChangeDenominator (validated, falls back to Bhilai default if invalid)
 // If borConfig is nil, returns the default value of 8.
 func BaseFeeChangeDenominator(borConfig *BorConfig, number *big.Int) uint64 {
 	// Handle cases where bor consensus isn't available to avoid panic
 	if borConfig == nil {
 		return DefaultBaseFeeChangeDenominator
 	}
+	// If Lisovo is active and custom value is set, validate and use it
+	if borConfig.IsLisovo(number) && borConfig.BaseFeeChangeDenominator != nil {
+		val := *borConfig.BaseFeeChangeDenominator
+		// Validate: must be non-zero to prevent division by zero
+		if val > 0 {
+			return val
+		}
+		// Invalid value - log error and fall back to default
+		log.Error("Invalid BaseFeeChangeDenominator in BorConfig (must be > 0), falling back to default",
+			"configured", val)
+	}
+
+	// Fall back to hard fork based values
 	if borConfig.IsBhilai(number) {
 		return BaseFeeChangeDenominatorPostBhilai
 	} else if borConfig.IsDelhi(number) {
 		return BaseFeeChangeDenominatorPostDelhi
-	} else {
-		return BaseFeeChangeDenominatorPreDelhi
 	}
+	return DefaultBaseFeeChangeDenominator
 }
